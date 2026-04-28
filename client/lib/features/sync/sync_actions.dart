@@ -140,19 +140,35 @@ class SyncActions {
   }
 
   // Pushes every local note to the server, then pulls any server notes missing
-  // locally. Used on login and "Sync all" action.
-  Future<({int pushed, int notes})> syncAllNotes() async {
+  // locally. [onProgress] is called after each note with (current, total).
+  Future<({int pushed, int notes})> syncAllNotes({
+    void Function(int current, int total)? onProgress,
+  }) async {
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return (pushed: 0, notes: 0);
     final api = apiFor(auth);
     final repo = ref.read(repositoryProvider);
 
-    // ── Push local notes ──────────────────────────────────────────────
     final summaries = await repo.listNoteSummaries();
     final localIds = summaries.map((s) => s.id).toSet();
+
+    // Fetch server list upfront so we know the true total.
+    List<Map<String, dynamic>> serverNotes = const [];
+    try { serverNotes = await api.listNotes(); } catch (_) {}
+    final serverOnlyIds = serverNotes
+        .map((s) => s['id'] as String)
+        .where((id) => !localIds.contains(id))
+        .toList();
+
+    final total = summaries.length + serverOnlyIds.length;
+    int current = 0;
     int pushed = 0;
     int notes = 0;
+
+    // ── Push local notes ──────────────────────────────────────────────
     for (final s in summaries) {
+      current++;
+      onProgress?.call(current, total);
       final state = await repo.loadByNoteId(s.id);
       if (state == null) continue;
       try {
@@ -162,20 +178,17 @@ class SyncActions {
       } catch (_) {}
     }
 
-    // ── Pull server notes not yet on this device ──────────────────────
-    try {
-      final serverNotes = await api.listNotes();
-      for (final sn in serverNotes) {
-        final id = sn['id'] as String;
-        if (localIds.contains(id)) continue; // already local
-        try {
-          final pullData = await api.syncPull(id, 0);
-          await repo.applyServerPull(pullData,
-              ownerId: auth.tokens?.userId ?? '');
-          notes++;
-        } catch (_) {}
-      }
-    } catch (_) {}
+    // ── Pull server-only notes ────────────────────────────────────────
+    for (final id in serverOnlyIds) {
+      current++;
+      onProgress?.call(current, total);
+      try {
+        final pullData = await api.syncPull(id, 0);
+        await repo.applyServerPull(pullData,
+            ownerId: auth.tokens?.userId ?? '');
+        notes++;
+      } catch (_) {}
+    }
 
     return (pushed: pushed, notes: notes);
   }

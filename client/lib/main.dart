@@ -1451,16 +1451,31 @@ class _CanvasCloudStatus extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final cloud = ref.watch(cloudSyncProvider);
 
-    final (icon, label) = switch (cloud.status) {
-      CloudSyncStatus.notLoggedIn => (Icons.cloud_outlined,  ''),
-      CloudSyncStatus.idle        => (Icons.cloud,           '연결됨'),
-      CloudSyncStatus.checking    => (Icons.sync,            '확인 중'),
-      CloudSyncStatus.syncing     => (Icons.sync,            '싱크 중'),
-      CloudSyncStatus.ok          => (Icons.cloud_done,      '연결됨'),
-      CloudSyncStatus.error       => (Icons.cloud_off,       '오프라인'),
+    if (cloud.status == CloudSyncStatus.notLoggedIn) return const SizedBox.shrink();
+
+    final icon = switch (cloud.status) {
+      CloudSyncStatus.notLoggedIn => Icons.cloud_outlined,
+      CloudSyncStatus.idle        => Icons.cloud,
+      CloudSyncStatus.checking    => Icons.sync,
+      CloudSyncStatus.syncing     => Icons.sync,
+      CloudSyncStatus.ok          => Icons.cloud_done,
+      CloudSyncStatus.error       => Icons.cloud_off,
     };
 
-    if (cloud.status == CloudSyncStatus.notLoggedIn) return const SizedBox.shrink();
+    final String label;
+    if (cloud.status == CloudSyncStatus.syncing &&
+        cloud.syncTotal != null && cloud.syncTotal! > 0) {
+      label = '동기화중… (${cloud.syncCurrent ?? 0}/${cloud.syncTotal})';
+    } else {
+      label = switch (cloud.status) {
+        CloudSyncStatus.notLoggedIn => '',
+        CloudSyncStatus.idle        => '연결됨',
+        CloudSyncStatus.checking    => '확인 중',
+        CloudSyncStatus.syncing     => '동기화중…',
+        CloudSyncStatus.ok          => '연결됨',
+        CloudSyncStatus.error       => '오프라인',
+      };
+    }
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -1585,14 +1600,20 @@ class _EditorCloudDialog extends ConsumerWidget {
       CloudSyncStatus.error       => (Icons.cloud_off,      t.inkFaint),
     };
 
-    final statusLabel = switch (cloud.status) {
-      CloudSyncStatus.notLoggedIn => '로그인 필요',
-      CloudSyncStatus.idle        => '연결됨',
-      CloudSyncStatus.checking    => '확인 중…',
-      CloudSyncStatus.syncing     => '싱크 중…',
-      CloudSyncStatus.ok          => '연결됨',
-      CloudSyncStatus.error       => '오프라인',
-    };
+    final String statusLabel;
+    if (cloud.status == CloudSyncStatus.syncing &&
+        cloud.syncTotal != null && cloud.syncTotal! > 0) {
+      statusLabel = '동기화중… (${cloud.syncCurrent ?? 0}/${cloud.syncTotal})';
+    } else {
+      statusLabel = switch (cloud.status) {
+        CloudSyncStatus.notLoggedIn => '로그인 필요',
+        CloudSyncStatus.idle        => '연결됨',
+        CloudSyncStatus.checking    => '확인 중…',
+        CloudSyncStatus.syncing     => '동기화중…',
+        CloudSyncStatus.ok          => '연결됨',
+        CloudSyncStatus.error       => '오프라인',
+      };
+    }
 
     final labelStyle = TextStyle(
       fontFamily: 'Inter Tight',

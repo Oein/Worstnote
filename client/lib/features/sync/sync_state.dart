@@ -4,6 +4,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../auth/auth_state.dart';
+import '../library/library_state.dart';
 import 'sync_actions.dart';
 
 enum CloudSyncStatus {
@@ -23,14 +24,18 @@ class CloudSyncState {
     this.serverUrl,
     this.lastSyncPushed,
     this.lastSyncTotal,
+    this.syncCurrent,
+    this.syncTotal,
   });
 
   final CloudSyncStatus status;
   final String? errorMessage;
   final DateTime? lastCheckedAt;
   final String? serverUrl;
-  final int? lastSyncPushed;   // objects pushed in last sync
-  final int? lastSyncTotal;    // total notes processed in last sync
+  final int? lastSyncPushed;  // objects pushed in last sync
+  final int? lastSyncTotal;   // total notes processed in last sync
+  final int? syncCurrent;     // notes done so far in active sync
+  final int? syncTotal;       // total notes in active sync
 
   CloudSyncState copyWith({
     CloudSyncStatus? status,
@@ -39,6 +44,8 @@ class CloudSyncState {
     String? serverUrl,
     int? lastSyncPushed,
     int? lastSyncTotal,
+    int? syncCurrent,
+    int? syncTotal,
   }) => CloudSyncState(
     status: status ?? this.status,
     errorMessage: errorMessage,
@@ -46,6 +53,8 @@ class CloudSyncState {
     serverUrl: serverUrl ?? this.serverUrl,
     lastSyncPushed: lastSyncPushed ?? this.lastSyncPushed,
     lastSyncTotal: lastSyncTotal ?? this.lastSyncTotal,
+    syncCurrent: syncCurrent ?? this.syncCurrent,
+    syncTotal: syncTotal ?? this.syncTotal,
   );
 }
 
@@ -97,15 +106,27 @@ class CloudSyncNotifier extends Notifier<CloudSyncState> {
 
   Future<void> syncAll() async {
     if (state.status == CloudSyncStatus.notLoggedIn) return;
-    state = state.copyWith(status: CloudSyncStatus.syncing);
+    state = state.copyWith(
+      status: CloudSyncStatus.syncing,
+      syncCurrent: 0,
+      syncTotal: null,
+    );
     try {
-      final r = await ref.read(syncActionsProvider).syncAllNotes();
+      final r = await ref.read(syncActionsProvider).syncAllNotes(
+        onProgress: (current, total) {
+          state = state.copyWith(syncCurrent: current, syncTotal: total);
+        },
+      );
       state = state.copyWith(
         status: CloudSyncStatus.ok,
         lastCheckedAt: DateTime.now(),
         lastSyncPushed: r.pushed,
         lastSyncTotal: r.notes,
+        syncCurrent: null,
+        syncTotal: null,
       );
+      // Refresh library so newly pulled notes become visible.
+      await ref.read(libraryProvider.notifier).refresh();
       await Future<void>.delayed(const Duration(seconds: 3));
       if (state.status == CloudSyncStatus.ok) {
         state = state.copyWith(status: CloudSyncStatus.idle);
@@ -114,6 +135,8 @@ class CloudSyncNotifier extends Notifier<CloudSyncState> {
       state = state.copyWith(
         status: CloudSyncStatus.error,
         errorMessage: e.toString(),
+        syncCurrent: null,
+        syncTotal: null,
       );
     }
   }

@@ -17,7 +17,7 @@ class LoginDialog extends ConsumerStatefulWidget {
 class _LoginDialogState extends ConsumerState<LoginDialog> {
   final _email = TextEditingController();
   final _password = TextEditingController();
-  final _server = TextEditingController(text: 'http://localhost:8080');
+  final _server = TextEditingController(text: 'https://worstnote.oein.kr');
   bool _signupMode = false;
   bool _busy = false;
   String? _error;

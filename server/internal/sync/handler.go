@@ -160,7 +160,7 @@ type noteSummary struct {
 func (s *Service) ListNotes(w http.ResponseWriter, r *http.Request) {
 	c, _ := auth.ClaimsFromContext(r.Context())
 	rows, err := s.DB.Query(r.Context(),
-		`SELECT id, title, updated_at FROM notes WHERE user_id=$1 ORDER BY updated_at DESC`,
+		`SELECT id, title, updated_at FROM notes WHERE owner_id=$1 ORDER BY updated_at DESC`,
 		c.UserID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "query", err.Error())

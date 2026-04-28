@@ -3317,14 +3317,20 @@ class _CloudButtonState extends ConsumerState<_CloudButton>
     );
   }
 
-  String _tooltip(CloudSyncState s) => switch (s.status) {
-    CloudSyncStatus.notLoggedIn => '로그인 필요',
-    CloudSyncStatus.idle        => '연결됨',
-    CloudSyncStatus.checking    => '연결 확인 중…',
-    CloudSyncStatus.syncing     => '싱크 중…',
-    CloudSyncStatus.ok          => '연결됨',
-    CloudSyncStatus.error       => '오프라인',
-  };
+  String _tooltip(CloudSyncState s) {
+    if (s.status == CloudSyncStatus.syncing &&
+        s.syncTotal != null && s.syncTotal! > 0) {
+      return '동기화중… (${s.syncCurrent ?? 0}/${s.syncTotal})';
+    }
+    return switch (s.status) {
+      CloudSyncStatus.notLoggedIn => '로그인 필요',
+      CloudSyncStatus.idle        => '연결됨',
+      CloudSyncStatus.checking    => '연결 확인 중…',
+      CloudSyncStatus.syncing     => '동기화중…',
+      CloudSyncStatus.ok          => '연결됨',
+      CloudSyncStatus.error       => '오프라인',
+    };
+  }
 }
 
 // ─── Cloud badge on note thumbnails ──────────────────────────────────────
@@ -3383,6 +3389,31 @@ class _CloudBadgeState extends ConsumerState<_CloudBadge>
       iconWidget = RotationTransition(turns: _spin, child: iconWidget);
     }
 
+    final showProgress = cloud.status == CloudSyncStatus.syncing &&
+        cloud.syncTotal != null && cloud.syncTotal! > 0;
+
+    if (showProgress) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.45),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          iconWidget,
+          const SizedBox(width: 4),
+          Text(
+            '${cloud.syncCurrent ?? 0}/${cloud.syncTotal}',
+            style: const TextStyle(
+              color: Colors.white70,
+              fontFamily: 'Inter Tight',
+              fontSize: 10,
+            ),
+          ),
+        ]),
+      );
+    }
+
     return Container(
       padding: const EdgeInsets.all(3),
       decoration: BoxDecoration(
@@ -3422,12 +3453,14 @@ class _CloudPopover extends ConsumerWidget {
               color: _statusColor(cloud.status, t),
             ),
             const SizedBox(width: 8),
-            Text(
-              _statusLabel(cloud.status),
-              style: TextStyle(
-                color: t.ink,
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
+            Expanded(
+              child: Text(
+                _statusLabel(cloud),
+                style: TextStyle(
+                  color: t.ink,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
           ]),
@@ -3553,14 +3586,20 @@ class _CloudPopover extends ConsumerWidget {
     CloudSyncStatus.error       => t.inkFaint,
   };
 
-  String _statusLabel(CloudSyncStatus s) => switch (s) {
-    CloudSyncStatus.notLoggedIn => '로그인 필요',
-    CloudSyncStatus.idle        => '연결됨',
-    CloudSyncStatus.checking    => '확인 중…',
-    CloudSyncStatus.syncing     => '싱크 중…',
-    CloudSyncStatus.ok          => '연결됨',
-    CloudSyncStatus.error       => '오프라인',
-  };
+  String _statusLabel(CloudSyncState s) {
+    if (s.status == CloudSyncStatus.syncing &&
+        s.syncTotal != null && s.syncTotal! > 0) {
+      return '동기화중… (${s.syncCurrent ?? 0}/${s.syncTotal})';
+    }
+    return switch (s.status) {
+      CloudSyncStatus.notLoggedIn => '로그인 필요',
+      CloudSyncStatus.idle        => '연결됨',
+      CloudSyncStatus.checking    => '확인 중…',
+      CloudSyncStatus.syncing     => '동기화중…',
+      CloudSyncStatus.ok          => '연결됨',
+      CloudSyncStatus.error       => '오프라인',
+    };
+  }
 
   String _relativeTime(DateTime dt) {
     final diff = DateTime.now().difference(dt);
