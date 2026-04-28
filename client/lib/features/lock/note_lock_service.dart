@@ -59,39 +59,46 @@ class NoteLockService {
   StreamSubscription<dynamic>? _eventSub;
 
   void _initChannel() {
-    _eventSub = _events.receiveBroadcastStream().listen((dynamic raw) {
-      final map = Map<String, dynamic>.from(raw as Map);
-      final type = map['type'] as String;
+    _eventSub = _events.receiveBroadcastStream().listen(
+      (dynamic raw) {
+        final map = Map<String, dynamic>.from(raw as Map);
+        final type = map['type'] as String;
 
-      if (type == 'libraryChanged') {
-        final source = map['source'] as String?;
-        debugPrint('[Lock] libraryChanged event source=$source self=$sessionId');
-        if (source != sessionId) {
-          _libraryChangedController.add(null);
+        if (type == 'libraryChanged') {
+          final source = map['source'] as String?;
+          debugPrint('[Lock] libraryChanged event source=$source self=$sessionId');
+          if (source != sessionId) {
+            _libraryChangedController.add(null);
+          }
+          return;
         }
-        return;
-      }
 
-      if (type == 'toolChanged') {
-        final source = map['source'] as String?;
-        if (source != sessionId) {
-          _toolChangedController.add(null);
+        if (type == 'toolChanged') {
+          final source = map['source'] as String?;
+          if (source != sessionId) {
+            _toolChangedController.add(null);
+          }
+          return;
         }
-        return;
-      }
 
-      final target = map['target'] as String?;
-      final source = map['source'] as String?;
-      final noteId = map['noteId'] as String?;
-      if (target == null || source == null || noteId == null) return;
+        final target = map['target'] as String?;
+        final source = map['source'] as String?;
+        final noteId = map['noteId'] as String?;
+        if (target == null || source == null || noteId == null) return;
 
-      if (type == 'handoffRequest' && target == sessionId) {
-        _handoffRequestController.add(_HandoffEvent(source: source, noteId: noteId));
-      }
-      if (type == 'handoffAck' && target == sessionId) {
-        _pendingAcks[noteId]?.complete();
-      }
-    });
+        if (type == 'handoffRequest' && target == sessionId) {
+          _handoffRequestController.add(_HandoffEvent(source: source, noteId: noteId));
+        }
+        if (type == 'handoffAck' && target == sessionId) {
+          _pendingAcks[noteId]?.complete();
+        }
+      },
+      onError: (e) {
+        // Swallow MissingPluginException on platforms without the native channel.
+        debugPrint('[Lock] lock_events error (likely unsupported platform): $e');
+      },
+      cancelOnError: false,
+    );
   }
 
   /// Try to acquire the lock for [noteId].

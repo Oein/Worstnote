@@ -149,6 +149,37 @@ type itemResolution struct {
 	Resolution string `json:"resolution"` // local | server | deleted
 }
 
+// ───── List notes ─────────────────────────────────────────────────────────
+
+type noteSummary struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+func (s *Service) ListNotes(w http.ResponseWriter, r *http.Request) {
+	c, _ := auth.ClaimsFromContext(r.Context())
+	rows, err := s.DB.Query(r.Context(),
+		`SELECT id, title, updated_at FROM notes WHERE user_id=$1 ORDER BY updated_at DESC`,
+		c.UserID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "query", err.Error())
+		return
+	}
+	defer rows.Close()
+	var notes []noteSummary
+	for rows.Next() {
+		var n noteSummary
+		if err := rows.Scan(&n.ID, &n.Title, &n.UpdatedAt); err == nil {
+			notes = append(notes, n)
+		}
+	}
+	if notes == nil {
+		notes = []noteSummary{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"notes": notes})
+}
+
 // ───── Push ───────────────────────────────────────────────────────────────
 
 func (s *Service) Push(w http.ResponseWriter, r *http.Request) {

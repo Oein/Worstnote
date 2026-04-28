@@ -37,6 +37,7 @@ import 'package:notee/features/notebook/page_panel.dart';
 import 'package:notee/features/notebook/page_strip.dart';
 import 'package:notee/features/notebook/page_template_picker.dart';
 import 'package:notee/features/sync/sync_actions.dart';
+import 'package:notee/features/sync/sync_state.dart';
 import 'package:notee/features/toolbar/toolbar.dart';
 import 'package:notee/features/toolbar/toolbar_shell.dart'
     show ToolbarDock, toolbarDockProvider;
@@ -714,6 +715,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         );
                       }),
                     ),
+                    // Cloud sync status — top-left corner of canvas.
+                    const Positioned(
+                      left: 10,
+                      top: 10,
+                      child: _CanvasCloudStatus(),
+                    ),
                     // Zoom-reset button — shown when not at 100%.
                     ValueListenableBuilder<double>(
                       valueListenable: _zoomNotifier,
@@ -959,44 +966,7 @@ class _EditorTopBarState extends ConsumerState<_EditorTopBar> {
           onExport: _share,
           exporting: _exporting,
         ),
-        Builder(builder: (ctx) {
-          final auth = ref.watch(authProvider);
-          final loggedIn = auth.value?.isLoggedIn ?? false;
-          return Row(mainAxisSize: MainAxisSize.min, children: [
-            if (loggedIn)
-              IconButton(
-                tooltip: _syncBusy ? 'Syncing…' : 'Sync now',
-                icon: _syncBusy
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : Icon(Icons.sync, size: 16, color: t.ink),
-                onPressed: _syncBusy ? null : _syncNow,
-              ),
-            IconButton(
-              tooltip: loggedIn
-                  ? 'Connected (long-press to log out)'
-                  : 'Log in',
-              icon: Icon(
-                loggedIn ? Icons.cloud_done : Icons.cloud_outlined,
-                size: 16,
-                color: loggedIn ? t.accent : t.inkDim,
-              ),
-              onPressed: () async {
-                if (loggedIn) {
-                  await ref.read(authProvider.notifier).logout();
-                } else {
-                  await showDialog<void>(
-                    context: ctx,
-                    builder: (_) => const LoginDialog(),
-                  );
-                }
-              },
-            ),
-          ]);
-        }),
+        _EditorCloudButton(onSyncNow: _syncBusy ? null : _syncNow),
       ]),
     );
   }
@@ -1439,8 +1409,6 @@ class _FloatingSideActionsState extends ConsumerState<_FloatingSideActions> {
   @override
   Widget build(BuildContext context) {
     final t = NoteeProvider.of(context).tokens;
-    final auth = ref.watch(authProvider);
-    final loggedIn = auth.value?.isLoggedIn ?? false;
     return Material(
       color: t.toolbar,
       elevation: 4,
@@ -1448,37 +1416,7 @@ class _FloatingSideActionsState extends ConsumerState<_FloatingSideActions> {
       child: Padding(
         padding: const EdgeInsets.all(4),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          if (loggedIn)
-            IconButton(
-              tooltip: _busy ? 'Syncing…' : 'Sync now',
-              icon: _busy
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : Icon(Icons.sync, size: 18, color: t.ink),
-              onPressed: _busy ? null : _syncNow,
-            ),
-          IconButton(
-            tooltip:
-                loggedIn ? 'Connected (long-press to log out)' : 'Log in',
-            icon: Icon(
-              loggedIn ? Icons.cloud_done : Icons.cloud_outlined,
-              size: 18,
-              color: loggedIn ? t.accent : t.inkDim,
-            ),
-            onPressed: () async {
-              if (loggedIn) {
-                await ref.read(authProvider.notifier).logout();
-              } else {
-                await showDialog<void>(
-                  context: context,
-                  builder: (_) => const LoginDialog(),
-                );
-              }
-            },
-          ),
+          _EditorCloudButton(onSyncNow: _busy ? null : _syncNow),
         ]),
       ),
     );
@@ -1490,8 +1428,7 @@ class _FloatingSideActionsState extends ConsumerState<_FloatingSideActions> {
       final r = await ref.read(syncActionsProvider).syncNow();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content:
-            Text('Sync OK · pushed ${r.pushed} · pulled ${r.pulled}'),
+        content: Text('Sync OK · pushed ${r.pushed} · pulled ${r.pulled}'),
       ));
     } catch (e) {
       if (!mounted) return;
@@ -1502,6 +1439,272 @@ class _FloatingSideActionsState extends ConsumerState<_FloatingSideActions> {
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+}
+
+// ─── Canvas cloud status chip (top-left of note canvas) ──────────────────
+
+class _CanvasCloudStatus extends ConsumerWidget {
+  const _CanvasCloudStatus();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final cloud = ref.watch(cloudSyncProvider);
+
+    final (icon, label) = switch (cloud.status) {
+      CloudSyncStatus.notLoggedIn => (Icons.cloud_outlined,  ''),
+      CloudSyncStatus.idle        => (Icons.cloud,           '연결됨'),
+      CloudSyncStatus.checking    => (Icons.sync,            '확인 중'),
+      CloudSyncStatus.syncing     => (Icons.sync,            '싱크 중'),
+      CloudSyncStatus.ok          => (Icons.cloud_done,      '연결됨'),
+      CloudSyncStatus.error       => (Icons.cloud_off,       '오프라인'),
+    };
+
+    if (cloud.status == CloudSyncStatus.notLoggedIn) return const SizedBox.shrink();
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(icon, size: 12, color: Colors.white70),
+        if (label.isNotEmpty) ...[
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontFamily: 'Inter Tight',
+              fontSize: 11,
+            ),
+          ),
+        ],
+      ]),
+    );
+  }
+}
+
+// ─── Editor Cloud Button ───────────────────────────────────────────────────
+
+class _EditorCloudButton extends ConsumerStatefulWidget {
+  const _EditorCloudButton({required this.onSyncNow});
+  final VoidCallback? onSyncNow;
+
+  @override
+  ConsumerState<_EditorCloudButton> createState() => _EditorCloudButtonState();
+}
+
+class _EditorCloudButtonState extends ConsumerState<_EditorCloudButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _spin;
+
+  @override
+  void initState() {
+    super.initState();
+    _spin = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
+  }
+
+  @override
+  void dispose() {
+    _spin.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    final cloud = ref.watch(cloudSyncProvider);
+
+    if (cloud.status == CloudSyncStatus.checking ||
+        cloud.status == CloudSyncStatus.syncing) {
+      if (!_spin.isAnimating) _spin.repeat();
+    } else {
+      if (_spin.isAnimating) _spin.stop();
+    }
+
+    final (icon, color) = switch (cloud.status) {
+      CloudSyncStatus.notLoggedIn => (Icons.cloud_outlined, t.inkFaint),
+      CloudSyncStatus.idle        => (Icons.cloud,          t.inkDim),
+      CloudSyncStatus.checking    => (Icons.sync,           t.accent),
+      CloudSyncStatus.syncing     => (Icons.sync,           t.accent),
+      CloudSyncStatus.ok          => (Icons.cloud_done,     t.accent),
+      CloudSyncStatus.error       => (Icons.cloud_off,      t.inkFaint),
+    };
+
+    Widget iconWidget = Icon(icon, size: 18, color: color);
+    if (cloud.status == CloudSyncStatus.checking ||
+        cloud.status == CloudSyncStatus.syncing) {
+      iconWidget = RotationTransition(turns: _spin, child: iconWidget);
+    }
+
+    final tooltip = switch (cloud.status) {
+      CloudSyncStatus.notLoggedIn => '로그인',
+      CloudSyncStatus.idle        => '연결됨',
+      CloudSyncStatus.checking    => '확인 중…',
+      CloudSyncStatus.syncing     => '싱크 중…',
+      CloudSyncStatus.ok          => '연결됨',
+      CloudSyncStatus.error       => '오프라인',
+    };
+
+    return IconButton(
+      tooltip: tooltip,
+      icon: iconWidget,
+      onPressed: _openModal,
+    );
+  }
+
+  Future<void> _openModal() async {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => _EditorCloudDialog(onSyncNow: widget.onSyncNow),
+    );
+  }
+}
+
+class _EditorCloudDialog extends ConsumerWidget {
+  const _EditorCloudDialog({required this.onSyncNow});
+  final VoidCallback? onSyncNow;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = NoteeProvider.of(context).tokens;
+    final cloud = ref.watch(cloudSyncProvider);
+    final loggedIn = ref.watch(authProvider).value?.isLoggedIn ?? false;
+
+    final (icon, iconColor) = switch (cloud.status) {
+      CloudSyncStatus.notLoggedIn => (Icons.cloud_outlined, t.inkFaint),
+      CloudSyncStatus.idle        => (Icons.cloud,          t.accent),
+      CloudSyncStatus.checking    => (Icons.sync,           t.accent),
+      CloudSyncStatus.syncing     => (Icons.sync,           t.accent),
+      CloudSyncStatus.ok          => (Icons.cloud_done,     const Color(0xFF4CAF50)),
+      CloudSyncStatus.error       => (Icons.cloud_off,      t.inkFaint),
+    };
+
+    final statusLabel = switch (cloud.status) {
+      CloudSyncStatus.notLoggedIn => '로그인 필요',
+      CloudSyncStatus.idle        => '연결됨',
+      CloudSyncStatus.checking    => '확인 중…',
+      CloudSyncStatus.syncing     => '싱크 중…',
+      CloudSyncStatus.ok          => '연결됨',
+      CloudSyncStatus.error       => '오프라인',
+    };
+
+    final labelStyle = TextStyle(
+      fontFamily: 'Inter Tight',
+      fontSize: 13,
+      color: t.inkDim,
+    );
+
+    return Dialog(
+      backgroundColor: t.toolbar,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 300),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                Icon(icon, size: 18, color: iconColor),
+                const SizedBox(width: 8),
+                Text(
+                  statusLabel,
+                  style: TextStyle(
+                    fontFamily: 'Newsreader',
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                    color: t.ink,
+                  ),
+                ),
+              ]),
+              if (cloud.serverUrl != null) ...[
+                const SizedBox(height: 6),
+                Text(
+                  cloud.serverUrl!,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    color: t.inkFaint,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+              if (cloud.errorMessage != null) ...[
+                const SizedBox(height: 6),
+                Text(
+                  cloud.errorMessage!,
+                  style: const TextStyle(
+                    fontFamily: 'Inter Tight',
+                    fontSize: 11,
+                    color: Color(0xFFDC2626),
+                  ),
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+              const SizedBox(height: 16),
+              Divider(height: 1, thickness: 1, color: t.tbBorder),
+              const SizedBox(height: 12),
+              if (!loggedIn)
+                TextButton.icon(
+                  icon: Icon(Icons.login, size: 16, color: t.accent),
+                  label: Text('로그인', style: TextStyle(color: t.accent, fontFamily: 'Inter Tight', fontSize: 13)),
+                  onPressed: () {
+                    Navigator.pop(context);
+                    showDialog<void>(
+                      context: context,
+                      builder: (_) => const LoginDialog(),
+                    );
+                  },
+                )
+              else ...[
+                if (onSyncNow != null)
+                  TextButton.icon(
+                    icon: Icon(Icons.sync, size: 16, color: t.accent),
+                    label: Text('지금 동기화', style: labelStyle.copyWith(color: t.accent)),
+                    onPressed: () {
+                      Navigator.pop(context);
+                      onSyncNow!();
+                    },
+                  ),
+                TextButton.icon(
+                  icon: Icon(Icons.refresh, size: 16, color: t.inkDim),
+                  label: Text('연결 확인', style: labelStyle),
+                  onPressed: () {
+                    Navigator.pop(context);
+                    ref.read(cloudSyncProvider.notifier).checkNow();
+                  },
+                ),
+                TextButton.icon(
+                  icon: const Icon(Icons.logout, size: 16, color: Color(0xFFDC2626)),
+                  label: Text('로그아웃', style: labelStyle.copyWith(color: const Color(0xFFDC2626))),
+                  onPressed: () {
+                    Navigator.pop(context);
+                    ref.read(authProvider.notifier).logout();
+                  },
+                ),
+              ],
+              const SizedBox(height: 4),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: Text('닫기', style: TextStyle(fontFamily: 'Inter Tight', fontSize: 13, color: t.inkDim)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
 

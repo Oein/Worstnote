@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../theme/notee_theme.dart';
+import '../sync/sync_state.dart';
 import 'auth_state.dart';
 
 class LoginDialog extends ConsumerStatefulWidget {
@@ -47,6 +48,8 @@ class _LoginDialogState extends ConsumerState<LoginDialog> {
         await ctl.login(_email.text.trim(), _password.text);
       }
       if (mounted) Navigator.pop(context);
+      // Fire-and-forget: push all local notes after login (shows syncing indicator).
+      ref.read(cloudSyncProvider.notifier).syncAll();
     } catch (e) {
       setState(() => _error = e.toString());
     } finally {

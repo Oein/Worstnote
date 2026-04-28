@@ -6,6 +6,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../data/api/api_client.dart';
+import '../../data/db/repository.dart';
 import '../../domain/page_object.dart';
 import '../auth/auth_state.dart';
 import '../notebook/notebook_state.dart';
@@ -136,6 +137,47 @@ class SyncActions {
     final r = await api.syncPull(s.note.id, 0);
     final changes = (r['changes'] as List?) ?? const [];
     return (pulled: changes.length, cursor: (r['cursor'] as num?)?.toInt() ?? 0);
+  }
+
+  // Pushes every local note to the server, then pulls any server notes missing
+  // locally. Used on login and "Sync all" action.
+  Future<({int pushed, int notes})> syncAllNotes() async {
+    final auth = ref.read(authProvider).value;
+    if (auth == null || !auth.isLoggedIn) return (pushed: 0, notes: 0);
+    final api = apiFor(auth);
+    final repo = ref.read(repositoryProvider);
+
+    // ── Push local notes ──────────────────────────────────────────────
+    final summaries = await repo.listNoteSummaries();
+    final localIds = summaries.map((s) => s.id).toSet();
+    int pushed = 0;
+    int notes = 0;
+    for (final s in summaries) {
+      final state = await repo.loadByNoteId(s.id);
+      if (state == null) continue;
+      try {
+        final r = await _push(api, state);
+        pushed += r.pushed;
+        notes++;
+      } catch (_) {}
+    }
+
+    // ── Pull server notes not yet on this device ──────────────────────
+    try {
+      final serverNotes = await api.listNotes();
+      for (final sn in serverNotes) {
+        final id = sn['id'] as String;
+        if (localIds.contains(id)) continue; // already local
+        try {
+          final pullData = await api.syncPull(id, 0);
+          await repo.applyServerPull(pullData,
+              ownerId: auth.tokens?.userId ?? '');
+          notes++;
+        } catch (_) {}
+      }
+    } catch (_) {}
+
+    return (pushed: pushed, notes: notes);
   }
 }
 

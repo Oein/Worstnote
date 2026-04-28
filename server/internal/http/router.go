@@ -53,6 +53,7 @@ func NewRouter(d Deps) http.Handler {
 					r.Post("/auth/logout", d.Auth.Logout)
 				}
 				if d.Sync != nil {
+					r.Get("/sync/notes", d.Sync.ListNotes)
 					r.Post("/sync/{noteId}/push", d.Sync.Push)
 					r.Get("/sync/{noteId}/pull", d.Sync.Pull)
 					r.Get("/sync/{noteId}/history", d.Sync.History)

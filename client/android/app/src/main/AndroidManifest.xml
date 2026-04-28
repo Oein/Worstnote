@@ -3,7 +3,8 @@
         android:label="Worstnote"
         android:name="${applicationName}"
         android:resizeableActivity="true"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true">
 
         <!-- Android 15+: explicit signal that system UI (Samsung taskbar etc.)
              can expose controls to spawn new instances of this app. -->

@@ -86,7 +86,21 @@ class ApiClient {
     setTokens(null);
   }
 
+  // ── Health ─────────────────────────────────────────────────────────
+  Future<void> healthCheck() async {
+    await _dio.get<dynamic>('/v1/health');
+  }
+
   // ── Sync ───────────────────────────────────────────────────────────
+  Future<List<Map<String, dynamic>>> listNotes() async {
+    final r = await _withAuthRetry(() => _dio.get(
+          '/v1/sync/notes',
+          options: _bearerOpts(),
+        ));
+    final data = r.data as Map<String, dynamic>;
+    return List<Map<String, dynamic>>.from(data['notes'] as List? ?? const []);
+  }
+
   Future<Map<String, dynamic>> syncPush(
       String noteId, Map<String, dynamic> body) async {
     final r = await _withAuthRetry(() => _dio.post(

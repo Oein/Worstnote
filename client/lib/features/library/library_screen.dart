@@ -36,8 +36,11 @@ import '../../theme/notee_popover.dart';
 import '../../theme/notee_theme.dart';
 import '../../main.dart' show surfaceProvider;
 import 'thumbnail_service.dart';
+import '../auth/auth_state.dart';
+import '../auth/login_dialog.dart';
 import '../lock/note_lock_service.dart';
 import '../notebook/notebook_state.dart';
+import '../sync/sync_state.dart';
 import 'library_state.dart';
 
 enum _LibAction { newNotebook, newFolder, importPdf, importGoodNotes, importNotee }
@@ -255,6 +258,7 @@ class _TopBar extends ConsumerStatefulWidget {
 class _TopBarState extends ConsumerState<_TopBar> {
   final _newBtnKey = GlobalKey();
   final _viewMenuKey = GlobalKey();
+  final _cloudBtnKey = GlobalKey();
 
   Future<void> _openNewItemMenu() async {
     final result = await showNoteeMenu<_LibAction>(
@@ -468,7 +472,15 @@ class _TopBarState extends ConsumerState<_TopBar> {
             ),
           ),
         ),
-        const SizedBox(width: 8),
+        const SizedBox(width: 4),
+        // Cloud sync status button.
+        KeyedSubtree(
+          key: _cloudBtnKey,
+          child: _CloudButton(
+            anchorKey: _cloudBtnKey,
+          ),
+        ),
+        const SizedBox(width: 4),
         // View/sort menu button.
         KeyedSubtree(
           key: _viewMenuKey,
@@ -2165,6 +2177,12 @@ class _NotebookCover extends ConsumerWidget {
                     clipBehavior: Clip.antiAlias,
                     child: Stack(children: [
                     Positioned.fill(child: _CoverContent(note: note)),
+                    // Cloud sync badge — top-left corner.
+                    const Positioned(
+                      left: 6,
+                      top: 6,
+                      child: _CloudBadge(),
+                    ),
                     // Favorite star — top-right corner.
                     Positioned(
                       right: 6,
@@ -3215,6 +3233,377 @@ class _FolderAppearanceDialogState extends State<_FolderAppearanceDialog> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+// ─── Cloud sync status button ─────────────────────────────────────────────
+
+class _CloudButton extends ConsumerStatefulWidget {
+  const _CloudButton({required this.anchorKey});
+  final GlobalKey anchorKey;
+
+  @override
+  ConsumerState<_CloudButton> createState() => _CloudButtonState();
+}
+
+class _CloudButtonState extends ConsumerState<_CloudButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _spin;
+
+  @override
+  void initState() {
+    super.initState();
+    _spin = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
+  }
+
+  @override
+  void dispose() {
+    _spin.dispose();
+    super.dispose();
+  }
+
+  Future<void> _openPopover() async {
+    final t = NoteeProvider.of(context).tokens;
+    await showNoteePopover<void>(
+      context,
+      anchorKey: widget.anchorKey,
+      placement: NoteePopoverPlacement.below,
+      maxWidth: 260,
+      builder: (ctx) => _CloudPopover(tokens: t),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    final cloud = ref.watch(cloudSyncProvider);
+
+    // Drive spinner while checking or syncing.
+    if (cloud.status == CloudSyncStatus.checking ||
+        cloud.status == CloudSyncStatus.syncing) {
+      if (!_spin.isAnimating) _spin.repeat();
+    } else {
+      if (_spin.isAnimating) _spin.stop();
+    }
+
+    final (icon, color) = switch (cloud.status) {
+      CloudSyncStatus.notLoggedIn => (Icons.cloud_outlined,      t.inkFaint),
+      CloudSyncStatus.idle        => (Icons.cloud,               t.accent),
+      CloudSyncStatus.checking    => (Icons.sync,                t.accent),
+      CloudSyncStatus.syncing     => (Icons.sync,                t.accent),
+      CloudSyncStatus.ok          => (Icons.cloud_done,          const Color(0xFF4CAF50)),
+      CloudSyncStatus.error       => (Icons.cloud_off,           t.inkFaint),
+    };
+
+    Widget iconWidget = Icon(icon, size: 19, color: color);
+
+    if (cloud.status == CloudSyncStatus.checking ||
+        cloud.status == CloudSyncStatus.syncing) {
+      iconWidget = RotationTransition(
+        turns: _spin,
+        child: iconWidget,
+      );
+    }
+
+    return IconButton(
+      tooltip: _tooltip(cloud),
+      icon: iconWidget,
+      onPressed: _openPopover,
+    );
+  }
+
+  String _tooltip(CloudSyncState s) => switch (s.status) {
+    CloudSyncStatus.notLoggedIn => '로그인 필요',
+    CloudSyncStatus.idle        => '연결됨',
+    CloudSyncStatus.checking    => '연결 확인 중…',
+    CloudSyncStatus.syncing     => '싱크 중…',
+    CloudSyncStatus.ok          => '연결됨',
+    CloudSyncStatus.error       => '오프라인',
+  };
+}
+
+// ─── Cloud badge on note thumbnails ──────────────────────────────────────
+
+class _CloudBadge extends ConsumerStatefulWidget {
+  const _CloudBadge();
+
+  @override
+  ConsumerState<_CloudBadge> createState() => _CloudBadgeState();
+}
+
+class _CloudBadgeState extends ConsumerState<_CloudBadge>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _spin;
+
+  @override
+  void initState() {
+    super.initState();
+    _spin = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
+  }
+
+  @override
+  void dispose() {
+    _spin.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cloud = ref.watch(cloudSyncProvider);
+
+    if (cloud.status == CloudSyncStatus.notLoggedIn) return const SizedBox.shrink();
+
+    if (cloud.status == CloudSyncStatus.syncing ||
+        cloud.status == CloudSyncStatus.checking) {
+      if (!_spin.isAnimating) _spin.repeat();
+    } else {
+      if (_spin.isAnimating) _spin.stop();
+    }
+
+    final icon = switch (cloud.status) {
+      CloudSyncStatus.notLoggedIn => Icons.cloud_outlined,
+      CloudSyncStatus.idle        => Icons.cloud,
+      CloudSyncStatus.checking    => Icons.sync,
+      CloudSyncStatus.syncing     => Icons.sync,
+      CloudSyncStatus.ok          => Icons.cloud_done,
+      CloudSyncStatus.error       => Icons.cloud_off,
+    };
+
+    Widget iconWidget = Icon(icon, size: 12, color: Colors.white.withValues(alpha: 0.9));
+    if (cloud.status == CloudSyncStatus.syncing ||
+        cloud.status == CloudSyncStatus.checking) {
+      iconWidget = RotationTransition(turns: _spin, child: iconWidget);
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: cloud.status == CloudSyncStatus.error
+            ? Colors.black.withValues(alpha: 0.25)
+            : Colors.black.withValues(alpha: 0.18),
+        shape: BoxShape.circle,
+      ),
+      child: iconWidget,
+    );
+  }
+}
+
+// ─── Cloud status popover ─────────────────────────────────────────────────
+
+class _CloudPopover extends ConsumerWidget {
+  const _CloudPopover({required this.tokens});
+  final NoteeTokens tokens;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = tokens;
+    final cloud = ref.watch(cloudSyncProvider);
+    ref.watch(authProvider); // reactive rebuild on login/logout
+
+    return Padding(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Status header.
+          Row(children: [
+            Icon(
+              _statusIcon(cloud.status),
+              size: 16,
+              color: _statusColor(cloud.status, t),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              _statusLabel(cloud.status),
+              style: TextStyle(
+                color: t.ink,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ]),
+
+          // Server URL.
+          if (cloud.serverUrl != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              cloud.serverUrl!,
+              style: TextStyle(
+                color: t.inkFaint,
+                fontSize: 11,
+                fontFamily: 'monospace',
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
+
+          // Last checked.
+          if (cloud.lastCheckedAt != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              '마지막 확인: ${_relativeTime(cloud.lastCheckedAt!)}',
+              style: TextStyle(color: t.inkFaint, fontSize: 11),
+            ),
+          ],
+
+          // Last sync stats.
+          if (cloud.lastSyncTotal != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              '마지막 동기화: ${cloud.lastSyncTotal}개 노트, ${cloud.lastSyncPushed}개 항목 업로드',
+              style: TextStyle(color: t.inkFaint, fontSize: 11),
+            ),
+          ],
+
+          // Error message.
+          if (cloud.status == CloudSyncStatus.error &&
+              cloud.errorMessage != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              cloud.errorMessage!,
+              style: const TextStyle(color: Color(0xFFDC2626), fontSize: 11),
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
+
+          const SizedBox(height: 12),
+          Divider(height: 1, thickness: 1, color: t.tbBorder),
+          const SizedBox(height: 10),
+
+          // Actions.
+          if (cloud.status == CloudSyncStatus.notLoggedIn)
+            _ActionRow(
+              icon: Icons.login,
+              label: '로그인',
+              color: t.accent,
+              tokens: t,
+              onTap: () {
+                Navigator.of(context).pop();
+                showDialog<void>(
+                  context: context,
+                  builder: (_) => const LoginDialog(),
+                );
+              },
+            )
+          else ...[
+            _ActionRow(
+              icon: Icons.cloud_sync,
+              label: '모두 동기화',
+              color: t.accent,
+              tokens: t,
+              onTap: () {
+                Navigator.of(context).pop();
+                ref.read(cloudSyncProvider.notifier).syncAll();
+              },
+            ),
+            const SizedBox(height: 6),
+            _ActionRow(
+              icon: Icons.refresh,
+              label: '연결 확인',
+              color: t.inkDim,
+              tokens: t,
+              onTap: () {
+                Navigator.of(context).pop();
+                ref.read(cloudSyncProvider.notifier).checkNow();
+              },
+            ),
+            const SizedBox(height: 6),
+            _ActionRow(
+              icon: Icons.logout,
+              label: '로그아웃',
+              color: const Color(0xFFDC2626),
+              tokens: t,
+              onTap: () {
+                Navigator.of(context).pop();
+                ref.read(authProvider.notifier).logout();
+              },
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  IconData _statusIcon(CloudSyncStatus s) => switch (s) {
+    CloudSyncStatus.notLoggedIn => Icons.cloud_outlined,
+    CloudSyncStatus.idle        => Icons.cloud,
+    CloudSyncStatus.checking    => Icons.sync,
+    CloudSyncStatus.syncing     => Icons.sync,
+    CloudSyncStatus.ok          => Icons.cloud_done,
+    CloudSyncStatus.error       => Icons.cloud_off,
+  };
+
+  Color _statusColor(CloudSyncStatus s, NoteeTokens t) => switch (s) {
+    CloudSyncStatus.notLoggedIn => t.inkFaint,
+    CloudSyncStatus.idle        => t.accent,
+    CloudSyncStatus.checking    => t.accent,
+    CloudSyncStatus.syncing     => t.accent,
+    CloudSyncStatus.ok          => const Color(0xFF4CAF50),
+    CloudSyncStatus.error       => t.inkFaint,
+  };
+
+  String _statusLabel(CloudSyncStatus s) => switch (s) {
+    CloudSyncStatus.notLoggedIn => '로그인 필요',
+    CloudSyncStatus.idle        => '연결됨',
+    CloudSyncStatus.checking    => '확인 중…',
+    CloudSyncStatus.syncing     => '싱크 중…',
+    CloudSyncStatus.ok          => '연결됨',
+    CloudSyncStatus.error       => '오프라인',
+  };
+
+  String _relativeTime(DateTime dt) {
+    final diff = DateTime.now().difference(dt);
+    if (diff.inSeconds < 60) return '방금 전';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}분 전';
+    return '${diff.inHours}시간 전';
+  }
+}
+
+class _ActionRow extends StatelessWidget {
+  const _ActionRow({
+    required this.icon,
+    required this.label,
+    required this.color,
+    required this.tokens,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color color;
+  final NoteeTokens tokens;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+        child: Row(children: [
+          Icon(icon, size: 15, color: color),
+          const SizedBox(width: 8),
+          Text(
+            label,
+            style: TextStyle(
+              color: color,
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ]),
       ),
     );
   }

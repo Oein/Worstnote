@@ -536,6 +536,89 @@ class NotebookRepository {
         ));
   }
 
+  // ── Apply server pull response ─────────────────────────────────────
+  /// Saves a pull response (from GET /sync/{noteId}/pull?since=0) into the
+  /// local DB. Used to hydrate notes that exist on the server but not locally.
+  Future<void> applyServerPull(
+    Map<String, dynamic> pullData, {
+    required String ownerId,
+  }) async {
+    final now = DateTime.now().toUtc();
+    final noteJson = pullData['note'] as Map<String, dynamic>?;
+    if (noteJson == null) return;
+    final noteId = noteJson['id'] as String;
+
+    await db.transaction(() async {
+      await db.into(db.notes).insertOnConflictUpdate(NotesCompanion(
+        id: Value(noteId),
+        ownerId: Value(ownerId),
+        title: Value(noteJson['title'] as String? ?? 'Untitled'),
+        scrollAxis: Value(noteJson['scrollAxis'] as String? ?? 'vertical'),
+        inputDrawMode:
+            Value(noteJson['inputDrawMode'] as String? ?? 'any'),
+        defaultPageSpec: Value(
+            jsonEncode(noteJson['defaultPageSpec'] ?? {})),
+        rev: Value((noteJson['rev'] as num?)?.toInt() ?? 1),
+        createdAt: Value(now),
+        updatedAt: Value(
+            DateTime.tryParse(noteJson['updatedAt'] as String? ?? '') ??
+                now),
+      ));
+
+      for (final p in (pullData['pages'] as List? ?? const [])) {
+        final pm = p as Map<String, dynamic>;
+        await db.into(db.pages).insertOnConflictUpdate(PagesCompanion(
+          id: Value(pm['id'] as String),
+          noteId: Value(pm['noteId'] as String? ?? noteId),
+          idx: Value((pm['index'] as num?)?.toInt() ?? 0),
+          spec: Value(jsonEncode(pm['spec'] ?? {})),
+          rev: Value((pm['rev'] as num?)?.toInt() ?? 1),
+          updatedAt: Value(
+              DateTime.tryParse(pm['updatedAt'] as String? ?? '') ?? now),
+        ));
+      }
+
+      for (final l in (pullData['layers'] as List? ?? const [])) {
+        final lm = l as Map<String, dynamic>;
+        await db.into(db.layers).insertOnConflictUpdate(LayersCompanion(
+          id: Value(lm['id'] as String),
+          pageId: Value(lm['pageId'] as String),
+          z: Value((lm['z'] as num?)?.toInt() ?? 0),
+          name: Value(lm['name'] as String? ?? ''),
+          visible: Value(lm['visible'] as bool? ?? true),
+          locked: Value(lm['locked'] as bool? ?? false),
+          opacity:
+              Value((lm['opacity'] as num?)?.toDouble() ?? 1.0),
+          rev: Value((lm['rev'] as num?)?.toInt() ?? 1),
+        ));
+      }
+
+      for (final c in (pullData['changes'] as List? ?? const [])) {
+        final cm = c as Map<String, dynamic>;
+        final bboxList = cm['bbox'] as List?;
+        final bbox = (bboxList != null && bboxList.length >= 4)
+            ? Bbox(
+                minX: (bboxList[0] as num).toDouble(),
+                minY: (bboxList[1] as num).toDouble(),
+                maxX: (bboxList[2] as num).toDouble(),
+                maxY: (bboxList[3] as num).toDouble(),
+              )
+            : const Bbox(minX: 0, minY: 0, maxX: 0, maxY: 0);
+        await _putObject(
+          cm['id'] as String,
+          cm['pageId'] as String,
+          cm['layerId'] as String,
+          cm['kind'] as String,
+          jsonEncode(cm['data']),
+          bbox,
+          (cm['rev'] as num?)?.toInt() ?? 1,
+          cm['deleted'] as bool? ?? false,
+          null,
+        );
+      }
+    });
+  }
+
   // ── Load ──────────────────────────────────────────────────────────
   Future<NotebookState?> loadByNoteId(String noteId) async {
     final noteRow = await (db.select(db.notes)
