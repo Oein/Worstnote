@@ -1,0 +1,75 @@
+name: notee
+description: Cross-platform handwriting app (Notee) — macOS, iOS, Android.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management & immutable models
+  flutter_riverpod: ^2.5.1
+  riverpod_annotation: ^2.3.5
+  freezed_annotation: ^2.4.4
+  json_annotation: ^4.9.0
+
+  # IDs / time / utility
+  uuid: ^4.4.0
+  collection: ^1.18.0
+  meta: ^1.16.0
+
+  # Local DB (SQLite)
+  drift: ^2.18.0
+  sqlite3_flutter_libs: ^0.5.24
+  path_provider: ^2.1.3
+  path: ^1.9.0
+
+  # Networking
+  dio: ^5.4.3+1
+
+  # File / asset import
+  file_selector: ^1.0.3
+  image_picker: ^1.1.2
+  # PDF rendering — kept abstract behind an interface so we can switch later.
+  pdfrx: ^1.0.84
+
+  # Stylus crypto for hashing assets
+  crypto: ^3.0.3
+
+  # ZIP creation / reading (images ZIP export + .notee format)
+  archive: ^3.6.1
+
+  cupertino_icons: ^1.0.8
+
+  # Typography from the design handoff (Newsreader, JetBrains Mono).
+  google_fonts: ^6.2.1
+
+  # GoodNotes 5/6 (.goodnotes) package importer (path dep, vendored).
+  goodnotes_parser:
+    path: /Users/oein/Downloads/notes/goodnotes_parser
+
+  # Persistent tool/eraser preferences across app launches.
+  shared_preferences: ^2.3.0
+  syncfusion_flutter_pdf: ^33.2.3
+  spen_remote: ^0.0.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  # Lints
+  flutter_lints: ^4.0.0
+
+  # Codegen
+  build_runner: ^2.4.10
+  freezed: ^2.5.2
+  json_serializable: ^6.8.0
+  riverpod_generator: ^2.4.0
+  drift_dev: ^2.18.0
+
+flutter:
+  uses-material-design: true

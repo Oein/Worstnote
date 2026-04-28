@@ -1,0 +1,40 @@
+# Generated
+**/*.freezed.dart
+**/*.g.dart
+**/generated_plugin_registrant.dart
+
+# Flutter
+client/.dart_tool/
+client/.flutter-plugins
+client/.flutter-plugins-dependencies
+client/.packages
+client/build/
+client/.idea/
+client/.pub-cache/
+client/.pub/
+client/coverage/
+client/ios/Pods/
+client/ios/.symlinks/
+client/macos/Pods/
+client/macos/.symlinks/
+client/android/.gradle/
+client/android/app/build/
+client/android/local.properties
+client/android/captures/
+client/android/key.properties
+client/*.lock          # exception below
+!client/pubspec.lock
+
+# Go
+server/notee-api
+server/bin/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local secrets
+.env
+**/.env
+!**/.env.example

@@ -1,0 +1,23 @@
+# Reverse proxy + automatic Let's Encrypt for the Notee API.
+# Replace `notee.example.com` with your domain. Run Caddy on the same host
+# (or another host on the LAN) and point DNS at it.
+#
+# `notee-api` resolves via Docker's user-defined network when Caddy runs in
+# the same compose network; otherwise use `host.docker.internal:8080` or the
+# NAS LAN IP.
+
+notee.example.com {
+    encode zstd gzip
+    reverse_proxy notee-api:8080
+
+    # Tighten upload size for asset PUTs proxied through the API
+    # (default: direct-to-MinIO via presigned URL — these are auth/sync only).
+    request_body {
+        max_size 10MB
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}

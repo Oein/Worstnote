@@ -1,0 +1,122 @@
+# Notee backend stack — TrueNAS Scale deployment
+# =================================================================
+# Tested target: TrueNAS Scale 24.10 "Electric Eel" or newer (which uses
+# Docker Compose for Custom Apps). Older TrueNAS Scale (Bluefin/Cobia)
+# uses K3s; for those, use the Helm-style manifests in ./k8s instead.
+#
+# How to deploy on TrueNAS Scale ≥ 24.10
+# --------------------------------------
+# 1) On the NAS, create a dataset for app data, e.g. `tank/apps/notee`
+#    with child datasets:
+#      tank/apps/notee/postgres
+#      tank/apps/notee/minio
+# 2) Copy this file + .env.example to the NAS (e.g. /mnt/tank/apps/notee/).
+#    Rename .env.example to .env and set strong secrets.
+# 3) In the TrueNAS UI: Apps → Discover Apps → "Custom App" → paste this
+#    docker-compose. Set the working directory to the folder containing
+#    your .env. (Or use `docker compose up -d` from a privileged shell.)
+# 4) After Postgres is healthy, run the migration job:
+#      docker compose --profile migrate run --rm migrate
+#    (You only need to do this once, and again on each schema bump.)
+# 5) Point a reverse proxy (Traefik / Caddy / nginx) at the `notee-api`
+#    service on port 8080 with TLS termination. The included Caddy file
+#    in ./caddy/Caddyfile.example is a starting point.
+#
+# Resource sizing (typical home server, 5–20 users): 1 vCPU, 2GB RAM.
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    <<: *restart
+    container_name: notee-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-notee}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-notee}
+    volumes:
+      # Bind to a TrueNAS dataset so snapshots cover the DB.
+      - ${DATA_DIR:?set in .env}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-notee} -d ${POSTGRES_DB:-notee}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # No published port: only the API talks to it. If you need external
+    # access (for goose runs from your laptop), uncomment ports:
+    # ports: ["5432:5432"]
+
+  minio:
+    image: minio/minio:latest
+    <<: *restart
+    container_name: notee-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set in .env}
+    volumes:
+      - ${DATA_DIR:?set in .env}/minio:/data
+    ports:
+      - "${MINIO_S3_PORT:-9000}:9000"        # S3 API (clients PUT presigned URLs here)
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"   # Web console
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD} &&
+        mc mb --ignore-existing local/${S3_BUCKET:-notee-assets} &&
+        mc anonymous set none local/${S3_BUCKET:-notee-assets}
+      "
+    restart: "no"
+
+  notee-api:
+    image: ${NOTEE_API_IMAGE:-ghcr.io/oein/notee-api:latest}
+    <<: *restart
+    container_name: notee-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      APP_ENV: production
+      LOG_FORMAT: json
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-notee}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-notee}?sslmode=disable"
+      S3_ENDPOINT: "http://minio:9000"
+      S3_REGION: "us-east-1"
+      S3_BUCKET: "${S3_BUCKET:-notee-assets}"
+      S3_ACCESS_KEY: "${MINIO_ROOT_USER:-minioadmin}"
+      S3_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+      S3_USE_SSL: "false"
+      JWT_SECRET: "${JWT_SECRET:?set in .env}"
+      ACCESS_TOKEN_TTL: "15m"
+      REFRESH_TOKEN_TTL: "720h"
+    ports:
+      - "${API_PORT:-8080}:8080"
+
+  # One-shot migration runner. Activate with `--profile migrate`.
+  # Image rebuilt with goose pre-installed; see ./migrate.Dockerfile.
+  migrate:
+    profiles: ["migrate"]
+    build:
+      context: ../..
+      dockerfile: deploy/truenas/migrate.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-notee}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-notee}?sslmode=disable"
+    command: ["up"]
+    restart: "no"

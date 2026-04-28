@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://notee.app/schemas/notee.schema.json",
+  "title": "Notee shared schema (v0)",
+  "description": "Single source of truth for the data model shared between the Flutter client and the Go server. Both sides generate code from this file (Dart: json_serializable, Go: hand-written or quicktype). Keep field names and JSON encoding stable across versions.",
+  "$defs": {
+    "Uuid":   { "type": "string", "format": "uuid" },
+    "ColorArgb": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295,
+      "description": "0xAARRGGBB packed integer."
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 with nanos in UTC."
+    },
+
+    "ScrollAxis": { "enum": ["vertical", "horizontal"] },
+
+    "InputDrawMode": {
+      "enum": ["any", "stylusOnly"],
+      "description": "Per-note user preference. 'stylusOnly' is palm rejection — only Apple Pencil / S-Pen / Wacom drives drawing; finger gestures scroll the page instead."
+    },
+
+    "PaperKind": {
+      "enum": ["a4", "letter", "b5", "square", "custom", "pdfImported"]
+    },
+
+    "PageBackground": {
+      "oneOf": [
+        { "type": "object", "required": ["kind"], "properties": {
+            "kind": { "const": "blank" } } },
+        { "type": "object", "required": ["kind", "spacingPt"], "properties": {
+            "kind": { "const": "grid" },
+            "spacingPt": { "type": "number", "exclusiveMinimum": 0 } } },
+        { "type": "object", "required": ["kind", "spacingPt"], "properties": {
+            "kind": { "const": "ruled" },
+            "spacingPt": { "type": "number", "exclusiveMinimum": 0 } } },
+        { "type": "object", "required": ["kind", "spacingPt"], "properties": {
+            "kind": { "const": "dot" },
+            "spacingPt": { "type": "number", "exclusiveMinimum": 0 } } },
+        { "type": "object", "required": ["kind", "assetId"], "properties": {
+            "kind": { "const": "image" },
+            "assetId": { "$ref": "#/$defs/Uuid" } } },
+        { "type": "object", "required": ["kind", "assetId", "pageNo"], "properties": {
+            "kind": { "const": "pdf" },
+            "assetId": { "$ref": "#/$defs/Uuid" },
+            "pageNo":  { "type": "integer", "minimum": 1 } } }
+      ]
+    },
+
+    "PageSpec": {
+      "type": "object",
+      "required": ["widthPt", "heightPt", "kind", "background"],
+      "properties": {
+        "widthPt":    { "type": "number", "exclusiveMinimum": 0 },
+        "heightPt":   { "type": "number", "exclusiveMinimum": 0 },
+        "kind":       { "$ref": "#/$defs/PaperKind" },
+        "background": { "$ref": "#/$defs/PageBackground" }
+      }
+    },
+
+    "Note": {
+      "type": "object",
+      "required": ["id","ownerId","title","scrollAxis","defaultPageSpec","createdAt","updatedAt","rev","inputDrawMode"],
+      "properties": {
+        "id":              { "$ref": "#/$defs/Uuid" },
+        "ownerId":         { "$ref": "#/$defs/Uuid" },
+        "title":           { "type": "string", "minLength": 1, "maxLength": 256 },
+        "scrollAxis":      { "$ref": "#/$defs/ScrollAxis" },
+        "inputDrawMode":   { "$ref": "#/$defs/InputDrawMode" },
+        "defaultPageSpec": { "$ref": "#/$defs/PageSpec" },
+        "createdAt":       { "$ref": "#/$defs/Timestamp" },
+        "updatedAt":       { "$ref": "#/$defs/Timestamp" },
+        "rev":             { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "Page": {
+      "type": "object",
+      "required": ["id","noteId","index","spec","updatedAt","rev"],
+      "properties": {
+        "id":        { "$ref": "#/$defs/Uuid" },
+        "noteId":    { "$ref": "#/$defs/Uuid" },
+        "index":     { "type": "integer", "minimum": 0 },
+        "spec":      { "$ref": "#/$defs/PageSpec" },
+        "updatedAt": { "$ref": "#/$defs/Timestamp" },
+        "rev":       { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "Layer": {
+      "type": "object",
+      "required": ["id","pageId","z","name","visible","locked","opacity","rev"],
+      "properties": {
+        "id":      { "$ref": "#/$defs/Uuid" },
+        "pageId":  { "$ref": "#/$defs/Uuid" },
+        "z":       { "type": "integer", "minimum": 0 },
+        "name":    { "type": "string", "minLength": 1, "maxLength": 64 },
+        "visible": { "type": "boolean" },
+        "locked":  { "type": "boolean" },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 },
+        "rev":     { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "ToolKind": {
+      "enum": ["pen", "highlighter", "eraserStroke", "eraserArea", "tape"]
+    },
+
+    "StrokePoint": {
+      "type": "object",
+      "required": ["x","y","pressure","tiltX","tiltY","tMs"],
+      "properties": {
+        "x":        { "type": "number" },
+        "y":        { "type": "number" },
+        "pressure": { "type": "number", "minimum": 0, "maximum": 1 },
+        "tiltX":    { "type": "number" },
+        "tiltY":    { "type": "number" },
+        "tMs":      { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "Bbox": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 4,
+      "maxItems": 4,
+      "description": "[minx, miny, maxx, maxy] in page-pt coordinates."
+    },
+
+    "PageObjectKind": {
+      "enum": ["stroke", "shape", "text"]
+    },
+
+    "Stroke": {
+      "type": "object",
+      "required": ["id","pageId","layerId","kind","tool","colorArgb","widthPt","points","bbox","createdAt","rev","deleted"],
+      "properties": {
+        "id":         { "$ref": "#/$defs/Uuid" },
+        "pageId":     { "$ref": "#/$defs/Uuid" },
+        "layerId":    { "$ref": "#/$defs/Uuid" },
+        "kind":       { "const": "stroke" },
+        "tool":       { "$ref": "#/$defs/ToolKind" },
+        "colorArgb":  { "$ref": "#/$defs/ColorArgb" },
+        "widthPt":    { "type": "number", "exclusiveMinimum": 0 },
+        "opacity":    { "type": "number", "minimum": 0, "maximum": 1, "default": 1 },
+        "points":     { "type": "array", "items": { "$ref": "#/$defs/StrokePoint" } },
+        "bbox":       { "$ref": "#/$defs/Bbox" },
+        "createdAt":  { "$ref": "#/$defs/Timestamp" },
+        "createdBy":  { "anyOf": [ { "$ref": "#/$defs/Uuid" }, { "type": "null" } ] },
+        "rev":        { "type": "integer", "minimum": 0 },
+        "deleted":    { "type": "boolean" }
+      }
+    },
+
+    "ShapeKind": { "enum": ["triangle", "rectangle", "ellipse"] },
+
+    "Shape": {
+      "type": "object",
+      "required": ["id","pageId","layerId","kind","shape","bbox","rotation","colorArgb","strokeWidthPt","filled","regularized","rev","deleted"],
+      "properties": {
+        "id":            { "$ref": "#/$defs/Uuid" },
+        "pageId":        { "$ref": "#/$defs/Uuid" },
+        "layerId":       { "$ref": "#/$defs/Uuid" },
+        "kind":          { "const": "shape" },
+        "shape":         { "$ref": "#/$defs/ShapeKind" },
+        "bbox":          { "$ref": "#/$defs/Bbox" },
+        "rotation":      { "type": "number" },
+        "colorArgb":     { "$ref": "#/$defs/ColorArgb" },
+        "strokeWidthPt": { "type": "number", "exclusiveMinimum": 0 },
+        "filled":        { "type": "boolean" },
+        "regularized":   { "type": "boolean", "description": "Snapped to regular form (square/equilateral/circle)." },
+        "rev":           { "type": "integer", "minimum": 0 },
+        "deleted":       { "type": "boolean" }
+      }
+    },
+
+    "TextBox": {
+      "type": "object",
+      "required": ["id","pageId","layerId","kind","bbox","text","fontFamily","fontSizePt","fontWeight","colorArgb","rev","deleted"],
+      "properties": {
+        "id":         { "$ref": "#/$defs/Uuid" },
+        "pageId":     { "$ref": "#/$defs/Uuid" },
+        "layerId":    { "$ref": "#/$defs/Uuid" },
+        "kind":       { "const": "text" },
+        "bbox":       { "$ref": "#/$defs/Bbox" },
+        "text":       { "type": "string" },
+        "fontFamily": { "type": "string" },
+        "fontSizePt": { "type": "number", "exclusiveMinimum": 0 },
+        "fontWeight": { "type": "integer", "minimum": 100, "maximum": 900 },
+        "colorArgb":  { "$ref": "#/$defs/ColorArgb" },
+        "italic":     { "type": "boolean", "default": false },
+        "rev":        { "type": "integer", "minimum": 0 },
+        "deleted":    { "type": "boolean" }
+      }
+    },
+
+    "PageObject": {
+      "oneOf": [
+        { "$ref": "#/$defs/Stroke"  },
+        { "$ref": "#/$defs/Shape"   },
+        { "$ref": "#/$defs/TextBox" }
+      ]
+    },
+
+    "SyncChange": {
+      "type": "object",
+      "description": "Single object change in a /sync/push payload.",
+      "required": ["id","kind","data","rev","deleted","updatedAt"],
+      "properties": {
+        "id":        { "$ref": "#/$defs/Uuid" },
+        "kind":      { "$ref": "#/$defs/PageObjectKind" },
+        "data":      { "$ref": "#/$defs/PageObject" },
+        "rev":       { "type": "integer", "minimum": 1 },
+        "deleted":   { "type": "boolean" },
+        "updatedAt": { "$ref": "#/$defs/Timestamp" },
+        "deviceId":  { "type": "string" }
+      }
+    }
+  }
+}
