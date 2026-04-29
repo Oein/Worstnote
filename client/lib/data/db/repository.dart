@@ -756,5 +756,6 @@ class Debouncer {
     fn();
   }
 
+  void cancel() { _t?.cancel(); _t = null; }
   void dispose() => _t?.cancel();
 }

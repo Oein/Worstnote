@@ -250,18 +250,17 @@ class NotebookController extends Notifier<NotebookState> {
     }
   }
 
-  /// Flush any pending debounced save immediately.
-  /// Also schedules a thumbnail regeneration so the library cover is up-to-date
-  /// when the user navigates back from the editor.
+  /// Flush any pending debounced save immediately and wait for it to complete.
+  /// Also regenerates the thumbnail so the library cover is up-to-date.
   Future<void> flushDebounce() async {
     if (!_persistEnabled) return;
-    final repo = ref.read(repositoryProvider);
-    _saveDebouncer?.flush(() async {
-      try { await repo.saveAll(state); } catch (_) {}
-    });
-    // Invalidate the stale cached thumbnail so the library shows a spinner
-    // while the new one renders, rather than showing the old image.
-    ThumbnailService.instance.invalidate(state.note.id);
+    // Cancel any pending timer and save directly, awaiting completion.
+    _saveDebouncer?.cancel();
+    try { await ref.read(repositoryProvider).saveAll(state); } catch (_) {}
+    // Await invalidate before scheduling new generation — prevents the race
+    // where invalidate()'s file-delete runs after _generate() has already
+    // written the new thumbnail, wiping the fresh file.
+    await ThumbnailService.instance.invalidate(state.note.id);
     _scheduleThumbnail();
   }
 
