@@ -109,8 +109,10 @@ class NotebookRepository {
   }
 
   /// Recursive delete: drops the folder, its children, and any notes
-  /// (with all pages/layers/objects) inside.
-  Future<void> deleteFolder(String folderId) async {
+  /// (with all pages/layers/objects) inside. Returns the IDs of every
+  /// note that was deleted so the caller can sync tombstones to the server.
+  Future<List<String>> deleteFolder(String folderId) async {
+    final deletedNoteIds = <String>[];
     await db.transaction(() async {
       final allFolders = await listFolders();
       // Collect descendants.
@@ -126,16 +128,17 @@ class NotebookRepository {
         }
       }
       for (final fid in toDelete) {
-        // Delete notes in this folder (cascades to pages/layers/objects).
         final notes = await (db.select(db.notes)
               ..where((n) => n.folderId.equals(fid)))
             .get();
         for (final n in notes) {
+          deletedNoteIds.add(n.id);
           await deleteNote(n.id);
         }
         await (db.delete(db.folders)..where((t) => t.id.equals(fid))).go();
       }
     });
+    return deletedNoteIds;
   }
 
   // ── Notebooks (notes) summary ────────────────────────────────────
@@ -325,6 +328,13 @@ class NotebookRepository {
   Future<void> moveNoteToFolder(String noteId, String? folderId) async {
     await (db.update(db.notes)..where((n) => n.id.equals(noteId)))
         .write(NotesCompanion(folderId: Value(folderId)));
+  }
+
+  Future<void> moveFolderTo(String folderId, String? parentId) async {
+    await db.customStatement(
+      'UPDATE folders SET parent_id = ?, updated_at = ? WHERE id = ?',
+      [parentId, DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000, folderId],
+    );
   }
 
   Future<void> updateNoteTitle(String noteId, String title) async {

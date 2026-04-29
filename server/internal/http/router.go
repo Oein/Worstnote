@@ -54,6 +54,7 @@ func NewRouter(d Deps) http.Handler {
 				}
 				if d.Sync != nil {
 					r.Get("/sync/notes", d.Sync.ListNotes)
+					r.Delete("/sync/{noteId}", d.Sync.DeleteNote)
 					r.Post("/sync/{noteId}/push", d.Sync.Push)
 					r.Get("/sync/{noteId}/pull", d.Sync.Pull)
 					r.Get("/sync/{noteId}/history", d.Sync.History)

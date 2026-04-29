@@ -2,11 +2,11 @@
 // above the white-paper layer but below the inked layers.
 //
 // PDF pages are served from PdfRenderCache (pre-rendered PNG files on disk)
-// at one of four fixed scales: 25 %, 200 %, 400 %, 800 %. If the ideal
-// scale is not cached yet, the best available lower-res file is shown while
-// the target scale is rendered in the background. This eliminates the
-// blank-flash that the previous PdfPageView / in-memory render approach
-// caused on every frame.
+// at one of three fixed scales: 200 %, 400 %, 800 %. If the target scale is
+// not cached yet, the best already-cached lower scale is shown until the
+// target arrives. The mass low-res (25 %) placeholder pre-pass was removed —
+// each visible page enqueues its target scale at the front of the queue and
+// the 2 worker threads drain it.
 
 import 'dart:async';
 import 'dart:io';
@@ -107,8 +107,7 @@ class _BackgroundImageLayerState extends State<BackgroundImageLayer> {
       if (event.assetId != bg.assetId || event.pageNo != bg.pageNo) return;
 
       // Any newly-cached scale for our page is worth re-evaluating: it may
-      // be the exact target, or a usable intermediate (e.g. 200% while
-      // target is 800%) that beats the current 25% placeholder.
+      // be the exact target, or a usable higher-res scale.
       final currentScale = _displayScale;
       final isBetter =
           currentScale == null || event.scalePct > currentScale;
@@ -123,49 +122,58 @@ class _BackgroundImageLayerState extends State<BackgroundImageLayer> {
 
   // ── Display selection ───────────────────────────────────────────────────
 
-  /// Selects the best available cached file and enqueues whatever is needed.
-  ///
-  /// Loading sequence (first time, nothing cached):
-  ///   1. enqueue [25]  → fast placeholder
-  ///   2. onCached(25)  → calls _requestDisplay again → shows 25%, enqueues targetScale
-  ///   3. onCached(200) → calls _requestDisplay again → shows 200%
+  /// Picks the lowest already-cached scale that is ≥ target. Any cached
+  /// equal-or-higher scale is acceptable as the displayed background — no
+  /// need to wait for the exact target. Falls back to a lower-scale
+  /// placeholder + front-priority enqueue when nothing satisfies.
   Future<void> _requestDisplay() async {
     final bg = widget.background;
     if (bg is! PdfBackground) return;
     final pdfFile = _pdfFile;
     if (pdfFile == null) return;
 
-    final targetScale = PdfRenderCache.scaleForZoom(widget.zoom); // min 200
+    final targetScale = PdfRenderCache.scaleForZoom(widget.zoom);
 
-    // Best case: target is already cached → show it.
-    final targetFile = await PdfRenderCache.instance.getCached(
-        bg.assetId, bg.pageNo, targetScale);
-    if (targetFile != null) {
-      if (!mounted) return;
-      setState(() { _displayFile = targetFile; _displayScale = targetScale; });
-      return;
-    }
-
-    // Target not cached yet. Check for 25% placeholder.
-    final thumbFile = await PdfRenderCache.instance.getCached(
-        bg.assetId, bg.pageNo, 25);
-
-    if (thumbFile != null) {
-      // Show 25% while the target renders in the background.
-      if (!mounted) return;
-      if (_displayFile == null) {
-        setState(() { _displayFile = thumbFile; _displayScale = 25; });
+    // Walk all scales sorted ascending; pick the first one ≥ target that's
+    // already on disk. (allScales is [200, 400, 800].)
+    final eligible = PdfRenderCache.allScales.where((s) => s >= targetScale).toList()
+      ..sort();
+    for (final s in eligible) {
+      final f = await PdfRenderCache.instance.getCached(
+          bg.assetId, bg.pageNo, s);
+      if (f != null) {
+        if (!mounted) return;
+        setState(() {
+          _displayFile = f;
+          _displayScale = s;
+        });
+        return;
       }
-      PdfRenderCache.instance.enqueue(
-          pdfFile, bg.assetId, bg.pageNo, widget.size, [targetScale],
-          front: true);
-    } else {
-      // Nothing cached yet — render 25% first (fast), then target follows
-      // automatically when onCached fires and calls _requestDisplay again.
-      PdfRenderCache.instance.enqueue(
-          pdfFile, bg.assetId, bg.pageNo, widget.size, [25],
-          front: true);
     }
+
+    // Nothing ≥ target cached. Use the highest cached lower scale as a
+    // placeholder (better than blank) while we render the target.
+    if (_displayFile == null) {
+      final fallbacks = PdfRenderCache.allScales.where((s) => s < targetScale).toList()
+        ..sort((a, b) => b.compareTo(a)); // highest first
+      for (final s in fallbacks) {
+        final f = await PdfRenderCache.instance.getCached(
+            bg.assetId, bg.pageNo, s);
+        if (f != null) {
+          if (!mounted) return;
+          setState(() {
+            _displayFile = f;
+            _displayScale = s;
+          });
+          break;
+        }
+      }
+    }
+
+    // Priority is derived from the cache's visible/current-note hints, so
+    // a plain enqueue is sufficient — visible pages are picked first.
+    PdfRenderCache.instance.enqueue(
+        pdfFile, bg.assetId, bg.pageNo, widget.size, [targetScale]);
   }
 
   // ── Build ───────────────────────────────────────────────────────────────

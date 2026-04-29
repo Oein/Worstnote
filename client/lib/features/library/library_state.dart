@@ -12,6 +12,7 @@ import '../../core/ids.dart';
 import '../../data/db/repository.dart';
 import '../../domain/folder.dart';
 import '../lock/note_lock_service.dart';
+import '../sync/sync_actions.dart';
 import '../../domain/layer.dart';
 import '../../domain/note.dart';
 import '../../domain/page.dart';
@@ -171,7 +172,14 @@ class LibraryController extends AsyncNotifier<LibraryState> {
   }
 
   Future<void> deleteFolder(String folderId) async {
-    await ref.read(repositoryProvider).deleteFolder(folderId);
+    final deletedNoteIds =
+        await ref.read(repositoryProvider).deleteFolder(folderId);
+    final sync = ref.read(syncActionsProvider);
+    for (final id in deletedNoteIds) {
+      // Best-effort: queue tombstone, retry on next sync if offline.
+      // ignore: unawaited_futures
+      sync.queueDeleteNote(id);
+    }
     await _refreshAndBroadcast();
   }
 
@@ -387,6 +395,8 @@ class LibraryController extends AsyncNotifier<LibraryState> {
 
   Future<void> deleteNotebook(String noteId) async {
     await ref.read(repositoryProvider).deleteNote(noteId);
+    // ignore: unawaited_futures
+    ref.read(syncActionsProvider).queueDeleteNote(noteId);
     await _refreshAndBroadcast();
   }
 
@@ -397,8 +407,11 @@ class LibraryController extends AsyncNotifier<LibraryState> {
 
   Future<void> bulkDelete(Set<String> ids) async {
     final repo = ref.read(repositoryProvider);
+    final sync = ref.read(syncActionsProvider);
     for (final id in ids) {
       await repo.deleteNote(id);
+      // ignore: unawaited_futures
+      sync.queueDeleteNote(id);
     }
     await _refreshAndBroadcast();
   }
@@ -407,6 +420,31 @@ class LibraryController extends AsyncNotifier<LibraryState> {
     final repo = ref.read(repositoryProvider);
     for (final id in ids) {
       await repo.moveNoteToFolder(id, folderId);
+    }
+    await _refreshAndBroadcast();
+  }
+
+  Future<void> moveFolder(String folderId, String? parentId) async {
+    await ref.read(repositoryProvider).moveFolderTo(folderId, parentId);
+    await _refreshAndBroadcast();
+  }
+
+  Future<void> bulkMoveItems(
+      Set<String> noteIds, Set<String> folderIds, String? targetFolderId) async {
+    final repo = ref.read(repositoryProvider);
+    for (final id in noteIds) {
+      await repo.moveNoteToFolder(id, targetFolderId);
+    }
+    for (final id in folderIds) {
+      await repo.moveFolderTo(id, targetFolderId);
+    }
+    await _refreshAndBroadcast();
+  }
+
+  Future<void> bulkDuplicate(Set<String> noteIds) async {
+    final repo = ref.read(repositoryProvider);
+    for (final id in noteIds) {
+      await repo.duplicateNote(id);
     }
     await _refreshAndBroadcast();
   }

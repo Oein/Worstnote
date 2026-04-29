@@ -15,10 +15,12 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart' show PointerDeviceKind;
 import 'package:flutter/services.dart' show HardwareKeyboard;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../data/db/repository.dart';
 import '../../domain/folder.dart';
@@ -28,6 +30,7 @@ import '../../features/canvas/painters/background_painter.dart';
 import '../../features/canvas/widgets/background_image_layer.dart';
 import '../../features/export/export_dialog.dart';
 import '../../features/import/goodnotes_importer.dart';
+import '../../features/import/pdf_render_cache.dart';
 import '../../features/import/notee_importer.dart';
 import '../../features/import/pdf_importer.dart';
 import '../../theme/notee_dialog.dart';
@@ -40,6 +43,7 @@ import '../auth/auth_state.dart';
 import '../auth/login_dialog.dart';
 import '../lock/note_lock_service.dart';
 import '../notebook/notebook_state.dart';
+import '../sync/sync_actions.dart';
 import '../sync/sync_state.dart';
 import 'library_state.dart';
 
@@ -102,6 +106,15 @@ List<(Folder, int)> _buildFolderTree(
   return result;
 }
 
+// Collects [folderId] itself and all descendant folder IDs recursively.
+Set<String> _allDescendantFolderIds(List<Folder> folders, String folderId) {
+  final result = <String>{folderId};
+  for (final f in folders.where((f) => f.parentId == folderId)) {
+    result.addAll(_allDescendantFolderIds(folders, f.id));
+  }
+  return result;
+}
+
 class LibraryScreen extends ConsumerWidget {
   const LibraryScreen({super.key});
 
@@ -144,6 +157,11 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
     // Schedule thumbnail generation for any notes that don't have a cached cover.
     // Runs in the background (serial queue), never blocks the UI.
     WidgetsBinding.instance.addPostFrameCallback((_) => _scheduleMissingThumbnails());
+    // Resume any asset downloads that were interrupted by a previous crash
+    // or that another window started but didn't finish.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref.read(syncActionsProvider).resumeAssetDownloads();
+    });
     // Poll server every 30 seconds for new/changed notes.
     _syncPollingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
       final auth = ref.read(authProvider).value;
@@ -696,7 +714,6 @@ class _Sidebar extends ConsumerWidget {
             child: ListView(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
               children: [
-                const _Eyebrow(text: 'Library'),
                 _SidebarItem(
                   icon: NoteeIcon.home,
                   label: 'All notebooks',
@@ -903,6 +920,30 @@ class _MenuPopover extends StatelessWidget {
             },
             t: t,
           ),
+          _MenuRow(
+            icon: NoteeIcon.rows,
+            label: 'PDF 큐 보기',
+            onTap: () {
+              Navigator.of(context).pop();
+              showDialog<void>(
+                context: context,
+                builder: (_) => const _PdfQueueDialog(),
+              );
+            },
+            t: t,
+          ),
+          _MenuRow(
+            icon: NoteeIcon.gear,
+            label: 'PDF 렌더 스레드 수',
+            onTap: () async {
+              Navigator.of(context).pop();
+              await showDialog<void>(
+                context: context,
+                builder: (_) => const _PdfThreadsDialog(),
+              );
+            },
+            t: t,
+          ),
         ],
       ),
     );
@@ -964,6 +1005,256 @@ class _ThemeSubMenu extends StatelessWidget {
               t: t,
             ),
         ],
+      ),
+    );
+  }
+}
+
+// ── PDF queue viewer ─────────────────────────────────────────────────────
+class _PdfQueueDialog extends StatefulWidget {
+  const _PdfQueueDialog();
+  @override
+  State<_PdfQueueDialog> createState() => _PdfQueueDialogState();
+}
+
+class _PdfQueueDialogState extends State<_PdfQueueDialog> {
+  StreamSubscription<void>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _sub = PdfRenderCache.instance.onChanged.listen((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    final s = PdfRenderCache.instance.snapshot();
+    return Dialog(
+      backgroundColor: t.toolbar,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 480, maxHeight: 560),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(children: [
+                Text('PDF 렌더 큐',
+                    style: TextStyle(
+                      fontFamily: 'Newsreader',
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: t.ink,
+                    )),
+                const Spacer(),
+                Text('스레드 ${s.maxConcurrent}개 · 진행 중 ${s.running.length}',
+                    style: TextStyle(
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 11,
+                        color: t.inkFaint)),
+              ]),
+              const SizedBox(height: 12),
+              Expanded(
+                child: ListView(
+                  shrinkWrap: true,
+                  children: [
+                    _QueueSection(
+                        title: 'P0 · 보고있는 페이지',
+                        jobs: s.p0,
+                        accent: const Color(0xFF2563EB),
+                        t: t),
+                    _QueueSection(
+                        title: 'P1 · 현재 노트의 페이지',
+                        jobs: s.p1,
+                        accent: const Color(0xFF059669),
+                        t: t),
+                    _QueueSection(
+                        title: 'P2 · 나머지 노트',
+                        jobs: s.p2,
+                        accent: t.inkFaint,
+                        t: t),
+                    if (s.running.isNotEmpty)
+                      _QueueSection(
+                          title: '진행 중',
+                          jobs: s.running,
+                          accent: const Color(0xFFEF4444),
+                          t: t),
+                  ],
+                ),
+              ),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('닫기'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _QueueSection extends StatelessWidget {
+  const _QueueSection({
+    required this.title,
+    required this.jobs,
+    required this.accent,
+    required this.t,
+  });
+  final String title;
+  final List<PdfRenderJobView> jobs;
+  final Color accent;
+  final NoteeTokens t;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(color: accent, shape: BoxShape.circle),
+            ),
+            const SizedBox(width: 8),
+            Text(title,
+                style: TextStyle(
+                    fontFamily: 'Inter Tight',
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: t.inkDim)),
+            const SizedBox(width: 6),
+            Text('(${jobs.length})',
+                style: TextStyle(
+                    fontFamily: 'JetBrainsMono',
+                    fontSize: 11,
+                    color: t.inkFaint)),
+          ]),
+          const SizedBox(height: 6),
+          if (jobs.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 16),
+              child: Text('—',
+                  style: TextStyle(
+                      fontFamily: 'JetBrainsMono',
+                      fontSize: 11,
+                      color: t.inkFaint)),
+            )
+          else
+            for (final j in jobs)
+              Padding(
+                padding: const EdgeInsets.only(left: 16, top: 2),
+                child: Text(
+                  '${j.assetId.substring(0, math.min(8, j.assetId.length))}…  p${j.pageNo}  s${j.scalePct}%',
+                  style: TextStyle(
+                      fontFamily: 'JetBrainsMono',
+                      fontSize: 11,
+                      color: t.ink),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── PDF render thread count setting ──────────────────────────────────────
+class _PdfThreadsDialog extends StatefulWidget {
+  const _PdfThreadsDialog();
+  @override
+  State<_PdfThreadsDialog> createState() => _PdfThreadsDialogState();
+}
+
+class _PdfThreadsDialogState extends State<_PdfThreadsDialog> {
+  late int _value = PdfRenderCache.instance.maxConcurrent;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    return Dialog(
+      backgroundColor: t.toolbar,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 320),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text('PDF 렌더 스레드 수',
+                  style: TextStyle(
+                    fontFamily: 'Newsreader',
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    color: t.ink,
+                  )),
+              const SizedBox(height: 6),
+              Text(
+                '스레드 수가 많을수록 PDF 페이지가 빨리 렌더되지만, 메모리를 더 사용합니다.',
+                style: TextStyle(
+                  fontFamily: 'Inter Tight',
+                  fontSize: 12,
+                  color: t.inkDim,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(children: [
+                Text('$_value',
+                    style: TextStyle(
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 24,
+                        fontWeight: FontWeight.w600,
+                        color: t.ink)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Slider(
+                    value: _value.toDouble(),
+                    min: 1,
+                    max: 8,
+                    divisions: 7,
+                    label: '$_value',
+                    onChanged: (v) => setState(() => _value = v.round()),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 8),
+              Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('취소'),
+                ),
+                TextButton(
+                  onPressed: () async {
+                    PdfRenderCache.instance.setMaxConcurrent(_value);
+                    final prefs = await SharedPreferences.getInstance();
+                    await prefs.setInt('pdf_render_threads', _value);
+                    if (context.mounted) Navigator.of(context).pop();
+                  },
+                  child: const Text('저장'),
+                ),
+              ]),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1273,24 +1564,177 @@ class _MainArea extends ConsumerStatefulWidget {
 }
 
 class _MainAreaState extends ConsumerState<_MainArea> {
-  final Set<String> _selectedIds = {};
+  // note ids and folder ids are tracked separately so we know which type.
+  final Set<String> _selectedNoteIds = {};
+  final Set<String> _selectedFolderIds = {};
 
-  bool get _selectionMode => _selectedIds.isNotEmpty;
+  // Selection mode persists until explicitly closed (X button) — staying in
+  // selection mode with 0 items lets the user keep selecting after deselects.
+  bool _selectionMode = false;
 
-  void _toggleSelect(String id) {
+  Set<String> get _selectedIds => {..._selectedNoteIds, ..._selectedFolderIds};
+
+  void _toggleSelectNote(String id) {
     setState(() {
-      if (_selectedIds.contains(id)) {
-        _selectedIds.remove(id);
+      if (_selectedNoteIds.contains(id)) {
+        _selectedNoteIds.remove(id);
       } else {
-        _selectedIds.add(id);
+        _selectedNoteIds.add(id);
       }
     });
   }
 
-  void _clearSelection() => setState(() => _selectedIds.clear());
+  void _toggleSelectFolder(String id) {
+    setState(() {
+      if (_selectedFolderIds.contains(id)) {
+        _selectedFolderIds.remove(id);
+      } else {
+        _selectedFolderIds.add(id);
+      }
+    });
+  }
+
+  void _enterSelectionModeNote(String id) {
+    setState(() {
+      _selectionMode = true;
+      _selectedNoteIds.clear();
+      _selectedFolderIds.clear();
+      _selectedNoteIds.add(id);
+    });
+  }
+
+  void _enterSelectionModeFolder(String id) {
+    setState(() {
+      _selectionMode = true;
+      _selectedNoteIds.clear();
+      _selectedFolderIds.clear();
+      _selectedFolderIds.add(id);
+    });
+  }
+
+  void _selectAllVisible(List<Folder> folders, List<NoteSummary> notes) {
+    setState(() {
+      _selectionMode = true;
+      _selectedNoteIds.addAll(notes.map((n) => n.id));
+      _selectedFolderIds.addAll(folders.map((f) => f.id));
+    });
+  }
+
+  void _exitSelectionMode() => setState(() {
+    _selectionMode = false;
+    _selectedNoteIds.clear();
+    _selectedFolderIds.clear();
+  });
+
+  void _clearSelectedItems() => setState(() {
+    _selectedNoteIds.clear();
+    _selectedFolderIds.clear();
+  });
+
+  void _setSelectionFromRubberBand(
+      Set<String> noteIds, Set<String> folderIds, Offset globalPos) {
+    setState(() {
+      _selectedNoteIds
+        ..clear()
+        ..addAll(noteIds);
+      _selectedFolderIds
+        ..clear()
+        ..addAll(folderIds);
+      _selectionMode = _selectedNoteIds.isNotEmpty || _selectedFolderIds.isNotEmpty;
+    });
+    if (_selectionMode) {
+      _showRubberBandActions(globalPos);
+    }
+  }
+
+  Future<void> _showRubberBandActions(Offset pos) async {
+    final ctl = ref.read(libraryProvider.notifier);
+    final hasFolder = _selectedFolderIds.isNotEmpty;
+    final result = await showNoteeMenuAt<_BulkAction>(
+      context,
+      position: pos,
+      items: [
+        const NoteeMenuItem(
+          label: '이동',
+          value: _BulkAction.move,
+          icon: Icon(Icons.drive_file_move_outline, size: 16),
+        ),
+        if (!hasFolder)
+          const NoteeMenuItem(
+            label: '복제',
+            value: _BulkAction.duplicate,
+            icon: Icon(Icons.copy_rounded, size: 16),
+          ),
+        const NoteeMenuItem.separator(),
+        const NoteeMenuItem(
+          label: '삭제',
+          value: _BulkAction.delete,
+          icon: Icon(Icons.delete_outline, size: 16),
+          danger: true,
+        ),
+      ],
+    );
+    if (!mounted || result == null) return;
+    switch (result) {
+      case _BulkAction.move:
+        final lib = ref.read(libraryProvider).value;
+        final excludeIds = <String>{};
+        if (lib != null) {
+          for (final id in _selectedFolderIds) {
+            excludeIds.addAll(_allDescendantFolderIds(lib.folders, id));
+          }
+        }
+        if (!mounted) return;
+        final folderId =
+            await _pickFolder(context, ref, excludeFolderIds: excludeIds);
+        if (folderId != null && mounted) {
+          final target = folderId == '__root__' ? null : folderId;
+          await ctl.bulkMoveItems(
+              _selectedNoteIds, _selectedFolderIds, target);
+          _clearSelectedItems();
+        }
+      case _BulkAction.duplicate:
+        await ctl.bulkDuplicate(_selectedNoteIds);
+        _clearSelectedItems();
+      case _BulkAction.delete:
+        final total = _selectedNoteIds.length + _selectedFolderIds.length;
+        final ok = await noteeConfirm(context,
+            title: '$total개 항목 삭제', body: '선택한 항목이 모두 삭제됩니다.');
+        if (!mounted) return;
+        if (ok) {
+          for (final id in _selectedFolderIds) {
+            await ctl.deleteFolder(id);
+          }
+          if (_selectedNoteIds.isNotEmpty) {
+            await ctl.bulkDelete(_selectedNoteIds);
+          }
+          _clearSelectedItems();
+        }
+    }
+  }
 
   Future<void> _openNote(String id) async {
     debugPrint('[OpenNote] start id=$id');
+    // Notes still pulling their PDF/image originals are not openable —
+    // bump them to the front of the asset queue and wait.
+    final pending = ref.read(pendingAssetNotesProvider);
+    if (pending.contains(id)) {
+      final messenger = ScaffoldMessenger.of(context);
+      messenger
+        ..clearSnackBars()
+        ..showSnackBar(const SnackBar(
+          content: Text('동기화 중인 노트입니다. 잠시만 기다려 주세요…'),
+          duration: Duration(seconds: 30),
+        ));
+      try {
+        await ref.read(syncActionsProvider).prioritizeNoteAssets(id);
+      } finally {
+        if (mounted) {
+          ScaffoldMessenger.of(context).hideCurrentSnackBar();
+        }
+      }
+      if (!mounted) return;
+    }
     final lockService = ref.read(noteLockServiceProvider);
     final result = await lockService.acquire(id);
     debugPrint('[OpenNote] acquire returned $result mounted=$mounted');
@@ -1321,6 +1765,7 @@ class _MainAreaState extends ConsumerState<_MainArea> {
     final searchQuery = widget.searchQuery;
     final isGridView = widget.isGridView;
     final filter = widget.filter;
+    final pendingNoteIds = ref.watch(pendingAssetNotesProvider);
 
     // Filter changes the data scope: favorites/recent flatten across all
     // folders; otherwise we honor the current folder hierarchy.
@@ -1355,23 +1800,96 @@ class _MainAreaState extends ConsumerState<_MainArea> {
           // Multi-select bar replaces header when items are selected.
           if (_selectionMode)
             _MultiSelectBar(
-              count: _selectedIds.length,
-              onClear: _clearSelection,
-              onDelete: () async {
+              noteCount: _selectedNoteIds.length,
+              folderCount: _selectedFolderIds.length,
+              totalVisible: folders.length + notes.length,
+              onClear: _exitSelectionMode,
+              onSelectAll: () => _selectAllVisible(folders, notes),
+              onDelete: _selectedIds.isEmpty ? null : () async {
+                final total = _selectedIds.length;
                 final ok = await noteeConfirm(context,
-                    title: '${_selectedIds.length}개 항목 삭제',
+                    title: '$total개 항목 삭제',
                     body: '선택한 항목이 모두 삭제됩니다.');
+                if (!context.mounted) return;
                 if (ok) {
-                  await ctl.bulkDelete(_selectedIds);
-                  _clearSelection();
+                  if (_selectedFolderIds.isNotEmpty) {
+                    for (final id in _selectedFolderIds) {
+                      await ctl.deleteFolder(id);
+                    }
+                  }
+                  if (_selectedNoteIds.isNotEmpty) {
+                    await ctl.bulkDelete(_selectedNoteIds);
+                  }
+                  _clearSelectedItems();
                 }
               },
-              onMove: () async {
-                final folderId = await _pickFolder(context, ref);
+              onMove: _selectedIds.isEmpty ? null : () async {
+                // When moving folders: exclude self + descendants from picker.
+                final lib = ref.read(libraryProvider).value;
+                final excludeIds = <String>{};
+                if (lib != null) {
+                  for (final id in _selectedFolderIds) {
+                    excludeIds.addAll(_allDescendantFolderIds(lib.folders, id));
+                  }
+                }
+                if (!context.mounted) return;
+                final folderId = await _pickFolder(context, ref,
+                    excludeFolderIds: excludeIds);
                 if (folderId != null && context.mounted) {
                   final target = folderId == '__root__' ? null : folderId;
-                  await ctl.bulkMove(_selectedIds, target);
-                  _clearSelection();
+                  await ctl.bulkMoveItems(_selectedNoteIds, _selectedFolderIds, target);
+                  _clearSelectedItems();
+                }
+              },
+              onDuplicate: (_selectedFolderIds.isEmpty && _selectedNoteIds.isNotEmpty)
+                  ? () async {
+                      await ctl.bulkDuplicate(_selectedNoteIds);
+                      _clearSelectedItems();
+                    }
+                  : null,
+              // Single-item extras
+              singleFolder: _selectedFolderIds.length == 1 && _selectedNoteIds.isEmpty
+                  ? folders.where((f) => f.id == _selectedFolderIds.first).cast<Folder?>().firstOrNull
+                  : null,
+              singleNote: _selectedNoteIds.length == 1 && _selectedFolderIds.isEmpty
+                  ? notes.where((n) => n.id == _selectedNoteIds.first).cast<NoteSummary?>().firstOrNull
+                  : null,
+              onSingleFolderRename: (f) async {
+                final name = await noteeAskName(context,
+                    title: '폴더 이름 수정', initial: f.name, confirmLabel: '저장');
+                if (name != null && name.trim().isNotEmpty) {
+                  await ctl.renameFolder(f.id, name.trim());
+                }
+              },
+              onSingleFolderAppearance: (f) async {
+                if (!context.mounted) return;
+                final r = await showDialog<(int, String)>(
+                  context: context,
+                  builder: (_) => _FolderAppearanceDialog(
+                    initialColor: f.colorArgb, initialIconKey: f.iconKey),
+                );
+                if (r != null) await ctl.updateFolderAppearance(f.id, r.$1, r.$2);
+              },
+              onSingleNoteRename: (n) async {
+                final name = await noteeAskName(context,
+                    title: '노트 이름 수정', initial: n.title, confirmLabel: '저장');
+                if (name != null && name.trim().isNotEmpty) {
+                  await ctl.renameNotebook(n.id, name.trim());
+                }
+              },
+              onSingleNoteFavorite: (n) => ctl.toggleFavorite(n.id),
+              onSingleNoteExport: (n) async {
+                if (!context.mounted) return;
+                final repo = ref.read(repositoryProvider);
+                final nbState = await repo.loadByNoteId(n.id);
+                if (nbState == null || !context.mounted) return;
+                final path = await ExportDialog.show(context, nbState,
+                    suggestedName: n.title);
+                if (path != null && context.mounted) {
+                  ScaffoldMessenger.of(context)
+                    ..clearSnackBars()
+                    ..showSnackBar(SnackBar(content: Text('저장됨: $path'),
+                        duration: const Duration(seconds: 4)));
                 }
               },
             )
@@ -1408,20 +1926,6 @@ class _MainAreaState extends ConsumerState<_MainArea> {
                 ),
               ),
               const Spacer(),
-              // "New folder" lives in the top-bar "새 항목" menu now.
-              if (false)
-                TextButton.icon(
-                  onPressed: widget.onCreateFolder,
-                  icon: const Icon(Icons.create_new_folder_outlined, size: 16),
-                  label: const Text('New folder'),
-                  style: TextButton.styleFrom(
-                    textStyle: const TextStyle(
-                      fontFamily: 'Inter Tight',
-                      fontSize: 13,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
             ]),
           const SizedBox(height: 18),
           Expanded(
@@ -1431,46 +1935,64 @@ class _MainAreaState extends ConsumerState<_MainArea> {
                     ? _GridContent(
                         folders: folders,
                         notes: notes,
-                        selectedIds: _selectedIds,
-                        onOpenFolder: ctl.navigateInto,
-                        onFolderAction: (f) =>
-                            _showFolderActions(context, ref, f),
+                        selectedNoteIds: _selectedNoteIds,
+                        selectedFolderIds: _selectedFolderIds,
+                        pendingNoteIds: pendingNoteIds,
+                        selectionMode: _selectionMode,
+                        onOpenFolder: (id) {
+                          if (_selectionMode) {
+                            _toggleSelectFolder(id);
+                          } else {
+                            ctl.navigateInto(id);
+                          }
+                        },
+                        onEnterSelectionFolder: _enterSelectionModeFolder,
+                        onFolderContext: (f, pos) =>
+                            _showFolderContextMenu(context, ref, f, pos),
                         onOpenNote: (id) {
                           if (_selectionMode) {
-                            _toggleSelect(id);
+                            _toggleSelectNote(id);
                           } else {
                             _openNote(id);
                           }
                         },
-                        onNoteAction: (n) =>
-                            _showNotebookActions(context, ref, n),
-                        onFolderContext: (f, pos) =>
-                            _showFolderContextMenu(context, ref, f, pos),
+                        onEnterSelectionNote: _enterSelectionModeNote,
                         onNoteContext: (n, pos) =>
                             _showNoteContextMenu(context, ref, n, pos),
-                        onToggleSelect: _toggleSelect,
+                        onToggleSelectNote: _toggleSelectNote,
+                        onToggleSelectFolder: _toggleSelectFolder,
+                        onRubberBandSelect: _setSelectionFromRubberBand,
                       )
                     : _ListContent(
                         folders: folders,
                         notes: notes,
-                        selectedIds: _selectedIds,
-                        onOpenFolder: ctl.navigateInto,
-                        onFolderAction: (f) =>
-                            _showFolderActions(context, ref, f),
+                        selectedNoteIds: _selectedNoteIds,
+                        selectedFolderIds: _selectedFolderIds,
+                        pendingNoteIds: pendingNoteIds,
+                        selectionMode: _selectionMode,
+                        onOpenFolder: (id) {
+                          if (_selectionMode) {
+                            _toggleSelectFolder(id);
+                          } else {
+                            ctl.navigateInto(id);
+                          }
+                        },
+                        onEnterSelectionFolder: _enterSelectionModeFolder,
+                        onFolderContext: (f, pos) =>
+                            _showFolderContextMenu(context, ref, f, pos),
                         onOpenNote: (id) {
                           if (_selectionMode) {
-                            _toggleSelect(id);
+                            _toggleSelectNote(id);
                           } else {
                             _openNote(id);
                           }
                         },
-                        onNoteAction: (n) =>
-                            _showNotebookActions(context, ref, n),
-                        onFolderContext: (f, pos) =>
-                            _showFolderContextMenu(context, ref, f, pos),
+                        onEnterSelectionNote: _enterSelectionModeNote,
                         onNoteContext: (n, pos) =>
                             _showNoteContextMenu(context, ref, n, pos),
-                        onToggleSelect: _toggleSelect,
+                        onToggleSelectNote: _toggleSelectNote,
+                        onToggleSelectFolder: _toggleSelectFolder,
+                        onRubberBandSelect: _setSelectionFromRubberBand,
                       ),
           ),
         ],
@@ -1480,33 +2002,120 @@ class _MainAreaState extends ConsumerState<_MainArea> {
 }
 
 // ── Grid view ─────────────────────────────────────────────────────────
-class _GridContent extends StatelessWidget {
+class _GridContent extends StatefulWidget {
   const _GridContent({
     required this.folders,
     required this.notes,
     required this.onOpenFolder,
-    required this.onFolderAction,
+    required this.onEnterSelectionFolder,
     required this.onOpenNote,
-    required this.onNoteAction,
-    required this.onToggleSelect,
-    this.selectedIds = const {},
+    required this.onEnterSelectionNote,
+    required this.onToggleSelectNote,
+    required this.onToggleSelectFolder,
+    required this.onRubberBandSelect,
+    required this.selectionMode,
+    this.selectedNoteIds = const {},
+    this.selectedFolderIds = const {},
+    this.pendingNoteIds = const {},
     this.onFolderContext,
     this.onNoteContext,
   });
   final List<Folder> folders;
   final List<NoteSummary> notes;
-  final Set<String> selectedIds;
+  final Set<String> selectedNoteIds;
+  final Set<String> selectedFolderIds;
+  final Set<String> pendingNoteIds;
+  final bool selectionMode;
+  // Replaces selection with the items overlapped by the rubber-band rect,
+  // and reports the global cursor position for showing an actions menu.
+  final void Function(Set<String> noteIds, Set<String> folderIds, Offset globalPos) onRubberBandSelect;
   final void Function(String) onOpenFolder;
-  final void Function(Folder) onFolderAction;
+  final void Function(String) onEnterSelectionFolder;
   final void Function(String) onOpenNote;
-  final void Function(NoteSummary) onNoteAction;
-  final void Function(String id) onToggleSelect;
+  final void Function(String) onEnterSelectionNote;
+  final void Function(String id) onToggleSelectNote;
+  final void Function(String id) onToggleSelectFolder;
   final void Function(Folder, Offset)? onFolderContext;
   final void Function(NoteSummary, Offset)? onNoteContext;
 
   @override
+  State<_GridContent> createState() => _GridContentState();
+}
+
+class _GridContentState extends State<_GridContent> {
+  // Rubber-band selection state (mouse-only).
+  Offset? _dragStart;
+  Offset? _dragCurrent;
+  Offset? _dragEndGlobal;
+  final Map<String, GlobalKey> _itemKeys = {};
+
+  void _ensureKeys() {
+    for (final f in widget.folders) {
+      _itemKeys.putIfAbsent(f.id, GlobalKey.new);
+    }
+    for (final n in widget.notes) {
+      _itemKeys.putIfAbsent(n.id, GlobalKey.new);
+    }
+  }
+
+  Rect? get _selectionRect {
+    if (_dragStart == null || _dragCurrent == null) return null;
+    return Rect.fromPoints(_dragStart!, _dragCurrent!);
+  }
+
+  void _onPanEnd() {
+    final rect = _selectionRect;
+    final endGlobal = _dragEndGlobal;
+    if (rect != null && rect.size.longestSide > 6) {
+      final renderBox = context.findRenderObject() as RenderBox?;
+      if (renderBox != null) {
+        final newNoteIds = <String>{};
+        final newFolderIds = <String>{};
+        for (final entry in _itemKeys.entries) {
+          final key = entry.value;
+          final ctx = key.currentContext;
+          if (ctx == null) continue;
+          final itemBox = ctx.findRenderObject() as RenderBox?;
+          if (itemBox == null) continue;
+          final itemOffset = itemBox.localToGlobal(Offset.zero);
+          final itemRect = itemOffset & itemBox.size;
+          final localItemRect = Rect.fromLTWH(
+            itemRect.left - renderBox.localToGlobal(Offset.zero).dx,
+            itemRect.top - renderBox.localToGlobal(Offset.zero).dy,
+            itemRect.width,
+            itemRect.height,
+          );
+          if (rect.overlaps(localItemRect)) {
+            final isFolder = widget.folders.any((f) => f.id == entry.key);
+            if (isFolder) {
+              newFolderIds.add(entry.key);
+            } else {
+              newNoteIds.add(entry.key);
+            }
+          }
+        }
+        widget.onRubberBandSelect(
+          newNoteIds, newFolderIds, endGlobal ?? Offset.zero);
+      }
+    }
+    setState(() {
+      _dragStart = null;
+      _dragCurrent = null;
+      _dragEndGlobal = null;
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return GridView(
+    _ensureKeys();
+    final allItems = [
+      ...widget.folders.map((f) => f.id),
+      ...widget.notes.map((n) => n.id),
+    ];
+    // Keep only keys for current items
+    _itemKeys.removeWhere((id, _) => !allItems.contains(id));
+
+    final grid = GridView(
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
         maxCrossAxisExtent: 200,
         mainAxisExtent: 300,
@@ -1515,95 +2124,338 @@ class _GridContent extends StatelessWidget {
       ),
       padding: const EdgeInsets.only(top: 8, bottom: 72),
       children: [
-        for (final f in folders)
-          _FolderTile(
-            folder: f,
-            onOpen: () => onOpenFolder(f.id),
-            onLongPress: () => onFolderAction(f),
-            onContextMenu: onFolderContext == null
-                ? null
-                : (pos) => onFolderContext!(f, pos),
-          ),
-        for (final n in notes)
+        for (final f in widget.folders)
           _SelectableWrapper(
-            key: ValueKey(n.id),
-            id: n.id,
-            selected: selectedIds.contains(n.id),
-            onToggleSelect: onToggleSelect,
-            child: _NotebookCover(
-              note: n,
-              onTap: () => onOpenNote(n.id),
-              onLongPress: () => onNoteAction(n),
-              onContextMenu: onNoteContext == null
+            key: _itemKeys[f.id],
+            id: f.id,
+            selected: widget.selectedFolderIds.contains(f.id),
+            onToggleSelect: widget.onToggleSelectFolder,
+            onEnterSelection: widget.onEnterSelectionFolder,
+            child: _FolderTile(
+              folder: f,
+              onOpen: () => widget.onOpenFolder(f.id),
+              onLongPress: null, // handled by _SelectableWrapper
+              onContextMenu: widget.onFolderContext == null
                   ? null
-                  : (pos) => onNoteContext!(n, pos),
+                  : (pos) => widget.onFolderContext!(f, pos),
+            ),
+          ),
+        for (final n in widget.notes)
+          _SelectableWrapper(
+            key: _itemKeys[n.id],
+            id: n.id,
+            selected: widget.selectedNoteIds.contains(n.id),
+            onToggleSelect: widget.onToggleSelectNote,
+            onEnterSelection: widget.onEnterSelectionNote,
+            child: _SyncingOverlay(
+              syncing: widget.pendingNoteIds.contains(n.id),
+              child: _NotebookCover(
+                note: n,
+                onTap: () => widget.onOpenNote(n.id),
+                onLongPress: null, // handled by _SelectableWrapper
+                onContextMenu: widget.onNoteContext == null
+                    ? null
+                    : (pos) => widget.onNoteContext!(n, pos),
+              ),
             ),
           ),
       ],
     );
+
+    return Stack(children: [
+      Listener(
+        onPointerDown: (e) {
+          // Mouse-only rubber band (skip touch / stylus / trackpad pan).
+          if (e.kind == PointerDeviceKind.mouse && e.buttons == 1) {
+            setState(() {
+              _dragStart = e.localPosition;
+              _dragCurrent = e.localPosition;
+              _dragEndGlobal = e.position;
+            });
+          }
+        },
+        onPointerMove: (e) {
+          if (_dragStart != null) {
+            setState(() {
+              _dragCurrent = e.localPosition;
+              _dragEndGlobal = e.position;
+            });
+          }
+        },
+        onPointerUp: (_) => _onPanEnd(),
+        onPointerCancel: (_) => setState(() {
+          _dragStart = null;
+          _dragCurrent = null;
+          _dragEndGlobal = null;
+        }),
+        child: grid,
+      ),
+      if (_selectionRect != null)
+        Positioned.fill(
+          child: IgnorePointer(
+            child: CustomPaint(
+              painter: _RubberBandPainter(_selectionRect!),
+            ),
+          ),
+        ),
+    ]);
   }
 }
 
 // ── List / rows view ──────────────────────────────────────────────────
-class _ListContent extends StatelessWidget {
+class _ListContent extends StatefulWidget {
   const _ListContent({
     required this.folders,
     required this.notes,
     required this.onOpenFolder,
-    required this.onFolderAction,
+    required this.onEnterSelectionFolder,
     required this.onOpenNote,
-    required this.onNoteAction,
-    required this.onToggleSelect,
-    this.selectedIds = const {},
+    required this.onEnterSelectionNote,
+    required this.onToggleSelectNote,
+    required this.onToggleSelectFolder,
+    required this.onRubberBandSelect,
+    required this.selectionMode,
+    this.selectedNoteIds = const {},
+    this.selectedFolderIds = const {},
+    this.pendingNoteIds = const {},
     this.onFolderContext,
     this.onNoteContext,
   });
   final List<Folder> folders;
   final List<NoteSummary> notes;
-  final Set<String> selectedIds;
+  final Set<String> selectedNoteIds;
+  final Set<String> selectedFolderIds;
+  final Set<String> pendingNoteIds;
+  final bool selectionMode;
+  final void Function(Set<String> noteIds, Set<String> folderIds, Offset globalPos) onRubberBandSelect;
   final void Function(String) onOpenFolder;
-  final void Function(Folder) onFolderAction;
+  final void Function(String) onEnterSelectionFolder;
   final void Function(String) onOpenNote;
-  final void Function(NoteSummary) onNoteAction;
-  final void Function(String id) onToggleSelect;
+  final void Function(String) onEnterSelectionNote;
+  final void Function(String id) onToggleSelectNote;
+  final void Function(String id) onToggleSelectFolder;
   final void Function(Folder, Offset)? onFolderContext;
   final void Function(NoteSummary, Offset)? onNoteContext;
 
   @override
+  State<_ListContent> createState() => _ListContentState();
+}
+
+class _ListContentState extends State<_ListContent> {
+  Offset? _dragStart;
+  Offset? _dragCurrent;
+  Offset? _dragEndGlobal;
+  final Map<String, GlobalKey> _itemKeys = {};
+
+  void _ensureKeys() {
+    for (final f in widget.folders) {
+      _itemKeys.putIfAbsent(f.id, GlobalKey.new);
+    }
+    for (final n in widget.notes) {
+      _itemKeys.putIfAbsent(n.id, GlobalKey.new);
+    }
+  }
+
+  Rect? get _selectionRect {
+    if (_dragStart == null || _dragCurrent == null) return null;
+    return Rect.fromPoints(_dragStart!, _dragCurrent!);
+  }
+
+  void _onPanEnd() {
+    final rect = _selectionRect;
+    final endGlobal = _dragEndGlobal;
+    if (rect != null && rect.size.longestSide > 6) {
+      final renderBox = context.findRenderObject() as RenderBox?;
+      if (renderBox != null) {
+        final newNoteIds = <String>{};
+        final newFolderIds = <String>{};
+        for (final entry in _itemKeys.entries) {
+          final key = entry.value;
+          final ctx = key.currentContext;
+          if (ctx == null) continue;
+          final itemBox = ctx.findRenderObject() as RenderBox?;
+          if (itemBox == null) continue;
+          final itemOffset = itemBox.localToGlobal(Offset.zero);
+          final itemRect = itemOffset & itemBox.size;
+          final localItemRect = Rect.fromLTWH(
+            itemRect.left - renderBox.localToGlobal(Offset.zero).dx,
+            itemRect.top - renderBox.localToGlobal(Offset.zero).dy,
+            itemRect.width,
+            itemRect.height,
+          );
+          if (rect.overlaps(localItemRect)) {
+            final isFolder = widget.folders.any((f) => f.id == entry.key);
+            if (isFolder) {
+              newFolderIds.add(entry.key);
+            } else {
+              newNoteIds.add(entry.key);
+            }
+          }
+        }
+        widget.onRubberBandSelect(
+          newNoteIds, newFolderIds, endGlobal ?? Offset.zero);
+      }
+    }
+    setState(() {
+      _dragStart = null;
+      _dragCurrent = null;
+      _dragEndGlobal = null;
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return ListView(
+    _ensureKeys();
+    final allItems = [
+      ...widget.folders.map((f) => f.id),
+      ...widget.notes.map((n) => n.id),
+    ];
+    _itemKeys.removeWhere((id, _) => !allItems.contains(id));
+
+    final list = ListView(
       padding: const EdgeInsets.only(left: 16, right: 16, bottom: 72),
       children: [
-        for (final f in folders) ...[
-          _FolderListTile(
-            folder: f,
-            onOpen: () => onOpenFolder(f.id),
-            onLongPress: () => onFolderAction(f),
-            onContextMenu: onFolderContext == null
-                ? null
-                : (pos) => onFolderContext!(f, pos),
+        for (final f in widget.folders) ...[
+          _SelectableWrapper(
+            key: _itemKeys[f.id],
+            id: f.id,
+            selected: widget.selectedFolderIds.contains(f.id),
+            onToggleSelect: widget.onToggleSelectFolder,
+            onEnterSelection: widget.onEnterSelectionFolder,
+            child: _FolderListTile(
+              folder: f,
+              onOpen: () => widget.onOpenFolder(f.id),
+              onLongPress: null, // handled by _SelectableWrapper
+              onContextMenu: widget.onFolderContext == null
+                  ? null
+                  : (pos) => widget.onFolderContext!(f, pos),
+            ),
           ),
           const _ListDivider(),
         ],
-        for (final n in notes) ...[
+        for (final n in widget.notes) ...[
           _SelectableWrapper(
-            key: ValueKey(n.id),
+            key: _itemKeys[n.id],
             id: n.id,
-            selected: selectedIds.contains(n.id),
-            onToggleSelect: onToggleSelect,
-            child: _NoteListTile(
-              note: n,
-              onTap: () => onOpenNote(n.id),
-              onLongPress: () => onNoteAction(n),
-              onContextMenu: onNoteContext == null
-                  ? null
-                  : (pos) => onNoteContext!(n, pos),
+            selected: widget.selectedNoteIds.contains(n.id),
+            onToggleSelect: widget.onToggleSelectNote,
+            onEnterSelection: widget.onEnterSelectionNote,
+            child: _SyncingOverlay(
+              syncing: widget.pendingNoteIds.contains(n.id),
+              child: _NoteListTile(
+                note: n,
+                onTap: () => widget.onOpenNote(n.id),
+                onLongPress: null, // handled by _SelectableWrapper
+                onContextMenu: widget.onNoteContext == null
+                    ? null
+                    : (pos) => widget.onNoteContext!(n, pos),
+              ),
             ),
           ),
           const _ListDivider(),
         ],
       ],
     );
+
+    return Stack(children: [
+      Listener(
+        onPointerDown: (e) {
+          if (e.kind == PointerDeviceKind.mouse && e.buttons == 1) {
+            setState(() {
+              _dragStart = e.localPosition;
+              _dragCurrent = e.localPosition;
+              _dragEndGlobal = e.position;
+            });
+          }
+        },
+        onPointerMove: (e) {
+          if (_dragStart != null) {
+            setState(() {
+              _dragCurrent = e.localPosition;
+              _dragEndGlobal = e.position;
+            });
+          }
+        },
+        onPointerUp: (_) => _onPanEnd(),
+        onPointerCancel: (_) => setState(() {
+          _dragStart = null;
+          _dragCurrent = null;
+          _dragEndGlobal = null;
+        }),
+        child: list,
+      ),
+      if (_selectionRect != null)
+        Positioned.fill(
+          child: IgnorePointer(
+            child: CustomPaint(
+              painter: _RubberBandPainter(_selectionRect!),
+            ),
+          ),
+        ),
+    ]);
+  }
+}
+
+class _RubberBandPainter extends CustomPainter {
+  _RubberBandPainter(this.rect);
+  final Rect rect;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..color = const Color(0xFF2563EB).withValues(alpha: 0.12)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..color = const Color(0xFF2563EB).withValues(alpha: 0.6)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_RubberBandPainter old) => old.rect != rect;
+}
+
+/// Dim overlay + spinner shown on a note tile while its PDF/image originals
+/// are still downloading. Tap pass-through is intentional — `_openNote`
+/// handles the "tap during sync" case by prioritizing the asset queue.
+class _SyncingOverlay extends StatelessWidget {
+  const _SyncingOverlay({required this.syncing, required this.child});
+  final bool syncing;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!syncing) return child;
+    return Stack(children: [
+      Opacity(opacity: 0.55, child: child),
+      Positioned.fill(
+        child: IgnorePointer(
+          child: Center(
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.55),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Colors.white,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ]);
   }
 }
 
@@ -1616,18 +2468,21 @@ class _ListDivider extends StatelessWidget {
   }
 }
 
-/// Wraps a tile with Cmd+click selection support + selected highlight overlay.
+/// Wraps a tile with long-press → selection mode, Cmd/Shift+click selection,
+/// and a blue selection overlay when selected.
 class _SelectableWrapper extends StatelessWidget {
   const _SelectableWrapper({
     super.key,
     required this.id,
     required this.selected,
     required this.onToggleSelect,
+    required this.onEnterSelection,
     required this.child,
   });
   final String id;
   final bool selected;
   final void Function(String id) onToggleSelect;
+  final void Function(String id) onEnterSelection;
   final Widget child;
 
   @override
@@ -1639,6 +2494,7 @@ class _SelectableWrapper extends StatelessWidget {
           onToggleSelect(id);
         }
       },
+      onLongPress: () => onEnterSelection(id),
       child: Stack(children: [
         child,
         if (selected)
@@ -1683,31 +2539,66 @@ class _SelectableWrapper extends StatelessWidget {
 /// Toolbar shown above the content when items are selected.
 class _MultiSelectBar extends StatelessWidget {
   const _MultiSelectBar({
-    required this.count,
+    required this.noteCount,
+    required this.folderCount,
+    required this.totalVisible,
     required this.onClear,
+    required this.onSelectAll,
     required this.onDelete,
     required this.onMove,
+    this.onDuplicate,
+    this.singleFolder,
+    this.singleNote,
+    this.onSingleFolderRename,
+    this.onSingleFolderAppearance,
+    this.onSingleNoteRename,
+    this.onSingleNoteFavorite,
+    this.onSingleNoteExport,
   });
-  final int count;
+
+  final int noteCount;
+  final int folderCount;
+  final int totalVisible;
   final VoidCallback onClear;
-  final VoidCallback onDelete;
-  final VoidCallback onMove;
+  final VoidCallback onSelectAll;
+  final VoidCallback? onDelete;
+  final VoidCallback? onMove;
+  final VoidCallback? onDuplicate;
+  // Single-item extras
+  final Folder? singleFolder;
+  final NoteSummary? singleNote;
+  final void Function(Folder)? onSingleFolderRename;
+  final void Function(Folder)? onSingleFolderAppearance;
+  final void Function(NoteSummary)? onSingleNoteRename;
+  final void Function(NoteSummary)? onSingleNoteFavorite;
+  final void Function(NoteSummary)? onSingleNoteExport;
+
+  int get _count => noteCount + folderCount;
 
   @override
   Widget build(BuildContext context) {
     final t = NoteeProvider.of(context).tokens;
+    final allSelected = _count >= totalVisible;
+    final btnStyle = TextButton.styleFrom(
+      textStyle: const TextStyle(fontFamily: 'Inter Tight', fontSize: 13),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+    );
+
     return Row(
       children: [
+        // Left side: close + count + select-all
         IconButton(
           icon: const Icon(Icons.close),
           onPressed: onClear,
           iconSize: 18,
           color: t.inkDim,
           tooltip: '선택 해제',
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
         ),
-        const SizedBox(width: 4),
+        const SizedBox(width: 6),
         Text(
-          '$count개 선택됨',
+          '$_count개 선택됨',
           style: TextStyle(
             fontFamily: 'Inter Tight',
             fontSize: 15,
@@ -1715,29 +2606,79 @@ class _MultiSelectBar extends StatelessWidget {
             color: t.ink,
           ),
         ),
+        const SizedBox(width: 8),
+        if (!allSelected)
+          TextButton(
+            onPressed: onSelectAll,
+            style: btnStyle.copyWith(
+              foregroundColor: WidgetStatePropertyAll(t.inkDim),
+            ),
+            child: const Text('모두 선택'),
+          ),
         const Spacer(),
+        // Single-folder extras
+        if (singleFolder != null) ...[
+          TextButton.icon(
+            onPressed: () => onSingleFolderRename?.call(singleFolder!),
+            icon: const Icon(Icons.edit_outlined, size: 15),
+            label: const Text('이름 수정'),
+            style: btnStyle,
+          ),
+          TextButton.icon(
+            onPressed: () => onSingleFolderAppearance?.call(singleFolder!),
+            icon: const Icon(Icons.color_lens_outlined, size: 15),
+            label: const Text('색상/아이콘'),
+            style: btnStyle,
+          ),
+        ],
+        // Single-note extras
+        if (singleNote != null) ...[
+          TextButton.icon(
+            onPressed: () => onSingleNoteRename?.call(singleNote!),
+            icon: const Icon(Icons.edit_outlined, size: 15),
+            label: const Text('이름 수정'),
+            style: btnStyle,
+          ),
+          TextButton.icon(
+            onPressed: () => onSingleNoteFavorite?.call(singleNote!),
+            icon: Icon(
+              singleNote!.isFavorite ? Icons.star_rounded : Icons.star_border_rounded,
+              size: 15,
+            ),
+            label: Text(singleNote!.isFavorite ? '즐겨찾기 해제' : '즐겨찾기'),
+            style: btnStyle,
+          ),
+          TextButton.icon(
+            onPressed: () => onSingleNoteExport?.call(singleNote!),
+            icon: const Icon(Icons.ios_share_rounded, size: 15),
+            label: const Text('내보내기'),
+            style: btnStyle,
+          ),
+        ],
+        const SizedBox(width: 4),
+        // Common actions
         TextButton.icon(
           onPressed: onMove,
-          icon: const Icon(Icons.drive_file_move_outline, size: 16),
+          icon: const Icon(Icons.drive_file_move_outline, size: 15),
           label: const Text('이동'),
-          style: TextButton.styleFrom(
-            textStyle: const TextStyle(
-              fontFamily: 'Inter Tight',
-              fontSize: 13,
-            ),
-          ),
+          style: btnStyle,
         ),
+        if (onDuplicate != null) ...[
+          const SizedBox(width: 4),
+          TextButton.icon(
+            onPressed: onDuplicate,
+            icon: const Icon(Icons.copy_rounded, size: 15),
+            label: const Text('복제'),
+            style: btnStyle,
+          ),
+        ],
         const SizedBox(width: 4),
         TextButton.icon(
           onPressed: onDelete,
-          icon: const Icon(Icons.delete_outline, size: 16),
+          icon: const Icon(Icons.delete_outline, size: 15),
           label: const Text('삭제'),
-          style: TextButton.styleFrom(
-            foregroundColor: const Color(0xFFEF4444),
-            textStyle: const TextStyle(
-              fontFamily: 'Inter Tight',
-              fontSize: 13,
-            ),
+          style: btnStyle.copyWith(
+            foregroundColor: const WidgetStatePropertyAll(Color(0xFFEF4444)),
           ),
         ),
       ],
@@ -1749,12 +2690,12 @@ class _FolderListTile extends StatelessWidget {
   const _FolderListTile({
     required this.folder,
     required this.onOpen,
-    required this.onLongPress,
+    this.onLongPress,
     this.onContextMenu,
   });
   final Folder folder;
   final VoidCallback onOpen;
-  final VoidCallback onLongPress;
+  final VoidCallback? onLongPress;
   final void Function(Offset globalPos)? onContextMenu;
 
   @override
@@ -1812,12 +2753,12 @@ class _NoteListTile extends StatelessWidget {
   const _NoteListTile({
     required this.note,
     required this.onTap,
-    required this.onLongPress,
+    this.onLongPress,
     this.onContextMenu,
   });
   final NoteSummary note;
   final VoidCallback onTap;
-  final VoidCallback onLongPress;
+  final VoidCallback? onLongPress;
   final void Function(Offset globalPos)? onContextMenu;
 
   @override
@@ -1996,12 +2937,12 @@ class _FolderTile extends StatelessWidget {
   const _FolderTile({
     required this.folder,
     required this.onOpen,
-    required this.onLongPress,
+    this.onLongPress,
     this.onContextMenu,
   });
   final Folder folder;
   final VoidCallback onOpen;
-  final VoidCallback onLongPress;
+  final VoidCallback? onLongPress;
   final void Function(Offset globalPos)? onContextMenu;
 
   @override
@@ -2137,12 +3078,12 @@ class _NotebookCover extends ConsumerWidget {
   const _NotebookCover({
     required this.note,
     required this.onTap,
-    required this.onLongPress,
+    this.onLongPress,
     this.onContextMenu,
   });
   final NoteSummary note;
   final VoidCallback onTap;
-  final VoidCallback onLongPress;
+  final VoidCallback? onLongPress;
   final void Function(Offset globalPos)? onContextMenu;
 
   @override
@@ -2634,181 +3575,6 @@ class _CoverTextsCanvasPainter extends CustomPainter {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-void _showFolderActions(BuildContext context, WidgetRef ref, Folder f) {
-  showModalBottomSheet<void>(
-    context: context,
-    showDragHandle: true,
-    builder: (_) => SafeArea(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          ListTile(
-            leading: const Icon(Icons.edit_outlined),
-            title: const Text('이름 수정'),
-            onTap: () async {
-              Navigator.pop(context);
-              final name = await noteeAskName(context,
-                  title: '폴더 이름 수정',
-                  initial: f.name,
-                  confirmLabel: '저장');
-              if (name != null && name.trim().isNotEmpty) {
-                await ref
-                    .read(libraryProvider.notifier)
-                    .renameFolder(f.id, name.trim());
-              }
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.color_lens_outlined),
-            title: const Text('색상/아이콘 변경'),
-            onTap: () async {
-              Navigator.pop(context);
-              if (!context.mounted) return;
-              final result = await showDialog<(int, String)>(
-                context: context,
-                builder: (_) => _FolderAppearanceDialog(
-                  initialColor: f.colorArgb,
-                  initialIconKey: f.iconKey,
-                ),
-              );
-              if (result != null) {
-                await ref
-                    .read(libraryProvider.notifier)
-                    .updateFolderAppearance(f.id, result.$1, result.$2);
-              }
-            },
-          ),
-          const Divider(height: 1),
-          ListTile(
-            leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-            title: const Text('삭제',
-                style: TextStyle(color: Colors.redAccent)),
-            onTap: () async {
-              Navigator.pop(context);
-              if (!context.mounted) return;
-              final ok = await noteeConfirm(context,
-                  title: '"${f.name}" 삭제',
-                  body: '폴더, 하위 폴더, 모든 노트북이 삭제됩니다.');
-              if (ok) {
-                await ref.read(libraryProvider.notifier).deleteFolder(f.id);
-              }
-            },
-          ),
-        ],
-      ),
-    ),
-  );
-}
-
-void _showNotebookActions(
-    BuildContext context, WidgetRef ref, NoteSummary n) {
-  showModalBottomSheet<void>(
-    context: context,
-    showDragHandle: true,
-    isScrollControlled: true,
-    builder: (_) => SafeArea(
-      child: SingleChildScrollView(child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          ListTile(
-            leading: const Icon(Icons.edit_outlined),
-            title: const Text('이름 수정'),
-            onTap: () async {
-              Navigator.pop(context);
-              final name = await noteeAskName(context,
-                  title: '노트 이름 수정',
-                  initial: n.title,
-                  confirmLabel: '저장');
-              if (name != null && name.trim().isNotEmpty) {
-                await ref
-                    .read(libraryProvider.notifier)
-                    .renameNotebook(n.id, name.trim());
-              }
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.copy_rounded),
-            title: const Text('복제'),
-            onTap: () async {
-              Navigator.pop(context);
-              await ref.read(libraryProvider.notifier).duplicateNotebook(n.id);
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.drive_file_move_outline),
-            title: const Text('이동'),
-            onTap: () async {
-              Navigator.pop(context);
-              if (!context.mounted) return;
-              final folderId =
-                  await _pickFolder(context, ref, currentFolderId: n.folderId);
-              if (folderId != null) {
-                final target = folderId == '__root__' ? null : folderId;
-                await ref
-                    .read(libraryProvider.notifier)
-                    .moveNotebook(n.id, target);
-              }
-            },
-          ),
-          ListTile(
-            leading: Icon(
-              n.isFavorite ? Icons.star_rounded : Icons.star_border_rounded,
-              color: n.isFavorite ? Colors.amber : null,
-            ),
-            title: Text(n.isFavorite ? '즐겨찾기 해제' : '즐겨찾기 추가'),
-            onTap: () {
-              Navigator.pop(context);
-              ref.read(libraryProvider.notifier).toggleFavorite(n.id);
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.ios_share_rounded),
-            title: const Text('내보내기'),
-            onTap: () async {
-              Navigator.pop(context);
-              if (!context.mounted) return;
-              final repo = ref.read(repositoryProvider);
-              final nbState = await repo.loadByNoteId(n.id);
-              if (nbState == null || !context.mounted) return;
-              final path = await ExportDialog.show(context, nbState,
-                  suggestedName: n.title);
-              if (path != null && context.mounted) {
-                ScaffoldMessenger.of(context)
-                  ..clearSnackBars()
-                  ..showSnackBar(SnackBar(
-                    content: Text('저장됨: $path'),
-                    duration: const Duration(seconds: 4),
-                    action: SnackBarAction(
-                      label: '닫기',
-                      onPressed: () =>
-                          ScaffoldMessenger.of(context).hideCurrentSnackBar(),
-                    ),
-                  ));
-              }
-            },
-          ),
-          const Divider(height: 1),
-          ListTile(
-            leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-            title: const Text('삭제',
-                style: TextStyle(color: Colors.redAccent)),
-            onTap: () async {
-              Navigator.pop(context);
-              if (!context.mounted) return;
-              final ok = await noteeConfirm(context,
-                  title: '"${n.title}" 삭제',
-                  body: '모든 페이지와 스트로크가 삭제됩니다.');
-              if (ok) {
-                await ref.read(libraryProvider.notifier).deleteNotebook(n.id);
-              }
-            },
-          ),
-        ],
-      )),
-    ),
-  );
-}
-
 String _relTime(DateTime t) {
   final d = DateTime.now().toUtc().difference(t.toUtc());
   if (d.inSeconds < 60) return 'just now';
@@ -2821,6 +3587,7 @@ String _relTime(DateTime t) {
 // ── Right-click context menus ─────────────────────────────────────────
 enum _NoteCtx { rename, duplicate, move, favorite, export, delete }
 enum _FolderCtx { rename, changeAppearance, delete }
+enum _BulkAction { move, duplicate, delete }
 
 Future<void> _showNoteContextMenu(
     BuildContext context, WidgetRef ref, NoteSummary n, Offset pos) async {
@@ -2982,6 +3749,7 @@ Future<String?> _pickFolder(
   BuildContext context,
   WidgetRef ref, {
   String? currentFolderId,
+  Set<String> excludeFolderIds = const {},
 }) async {
   final lib = ref.read(libraryProvider).value;
   if (lib == null) return null;
@@ -3028,25 +3796,26 @@ Future<String?> _pickFolder(
                     ),
                     for (final (f, depth)
                         in _buildFolderTree(lib.folders, null, 0))
-                      Padding(
-                        padding: EdgeInsets.only(left: depth * 16.0),
-                        child: ListTile(
-                          dense: true,
-                          leading: Icon(
-                            _folderIconFor(f.iconKey),
-                            color: Color(f.colorArgb),
-                          ),
-                          title: Text(
-                            f.name,
-                            style: TextStyle(
-                              fontFamily: 'Inter Tight',
-                              color: t.ink,
+                      if (!excludeFolderIds.contains(f.id))
+                        Padding(
+                          padding: EdgeInsets.only(left: depth * 16.0),
+                          child: ListTile(
+                            dense: true,
+                            leading: Icon(
+                              _folderIconFor(f.iconKey),
+                              color: Color(f.colorArgb),
                             ),
+                            title: Text(
+                              f.name,
+                              style: TextStyle(
+                                fontFamily: 'Inter Tight',
+                                color: t.ink,
+                              ),
+                            ),
+                            selected: currentFolderId == f.id,
+                            onTap: () => Navigator.of(context).pop(f.id),
                           ),
-                          selected: currentFolderId == f.id,
-                          onTap: () => Navigator.of(context).pop(f.id),
                         ),
-                      ),
                   ],
                 ),
               ),

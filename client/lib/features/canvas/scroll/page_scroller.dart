@@ -93,7 +93,37 @@ class PageScrollerState extends State<PageScroller>
         }
       });
     widget.scrollController.addListener(_scrollListener);
+    _publishCurrentNoteHint();
+    _publishVisibleHint();
     WidgetsBinding.instance.addPostFrameCallback((_) => _ensurePdfCache());
+  }
+
+  // Tell PdfRenderCache which pages are part of the open notebook (P1).
+  void _publishCurrentNoteHint() {
+    final pages = <({String assetId, int pageNo})>{};
+    for (final p in widget.pages) {
+      final bg = p.spec.background;
+      if (bg is PdfBackground) {
+        pages.add((assetId: bg.assetId, pageNo: bg.pageNo));
+      }
+    }
+    PdfRenderCache.instance.setCurrentNotePages(pages);
+  }
+
+  // Tell PdfRenderCache which page is currently visible (P0).
+  void _publishVisibleHint() {
+    if (_currentPage < 0 || _currentPage >= widget.pages.length) {
+      PdfRenderCache.instance.setVisiblePages({});
+      return;
+    }
+    final bg = widget.pages[_currentPage].spec.background;
+    if (bg is PdfBackground) {
+      PdfRenderCache.instance.setVisiblePages({
+        (assetId: bg.assetId, pageNo: bg.pageNo),
+      });
+    } else {
+      PdfRenderCache.instance.setVisiblePages({});
+    }
   }
 
   @override
@@ -103,12 +133,21 @@ class PageScrollerState extends State<PageScroller>
       oldWidget.scrollController.removeListener(_scrollListener);
       widget.scrollController.addListener(_scrollListener);
     }
+    if (oldWidget.pages.length != widget.pages.length ||
+        oldWidget.note.id != widget.note.id) {
+      _publishCurrentNoteHint();
+      _publishVisibleHint();
+    }
   }
 
   @override
   void dispose() {
     _snapBack.dispose();
     widget.scrollController.removeListener(_scrollListener);
+    // Notebook is closing — clear the hints so the cache demotes everything
+    // to P2 (background prefetch).
+    PdfRenderCache.instance.setVisiblePages({});
+    PdfRenderCache.instance.setCurrentNotePages({});
     super.dispose();
   }
 
@@ -197,6 +236,7 @@ class PageScrollerState extends State<PageScroller>
         if (_currentPage != i) {
           setState(() => _currentPage = i);
           widget.onPageChanged?.call(i);
+          _publishVisibleHint();
         }
         break;
       }
@@ -204,8 +244,9 @@ class PageScrollerState extends State<PageScroller>
     }
   }
 
-  /// Ensures 25% thumbnail cache files exist for all PDF pages and pre-warms
-  /// the pdfrx document cache for off-screen pages.
+  /// Pre-warms the PDF render cache: enqueues every page at 200% in the
+  /// background. Visible pages will subsequently bump themselves to the
+  /// front of the queue via BackgroundImageLayer.
   Future<void> _ensurePdfCache() async {
     final seen = <String>{};
     final toRender =
@@ -216,7 +257,6 @@ class PageScrollerState extends State<PageScroller>
       final bg = page.spec.background;
       if (bg is! PdfBackground) continue;
 
-      // Queue 25% thumbnail renders for pages not yet cached.
       final key = '${bg.assetId}_${bg.pageNo}';
       if (!seen.contains(key)) {
         seen.add(key);
@@ -228,7 +268,6 @@ class PageScrollerState extends State<PageScroller>
             pageNo: bg.pageNo,
             pageSize: Size(page.spec.widthPt, page.spec.heightPt),
           ));
-          // Also collect unique asset files for pdfrx document pre-warm.
           if (!toLoad.any((e) => e.assetId == bg.assetId)) {
             toLoad.add((assetId: bg.assetId, filePath: file.path));
           }
@@ -236,7 +275,7 @@ class PageScrollerState extends State<PageScroller>
       }
     }
 
-    PdfRenderCache.instance.ensureThumbnails(toRender);
+    PdfRenderCache.instance.prewarmAllPages(toRender);
 
     // Keep pre-warming the pdfrx document cache as before.
     for (final entry in toLoad) {

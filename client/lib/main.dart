@@ -9,10 +9,13 @@
 import 'dart:async';
 import 'dart:io' show Process;
 
+import 'package:dio/dio.dart';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:notee/domain/folder.dart';
 import 'package:notee/domain/layer.dart';
@@ -29,6 +32,7 @@ import 'package:notee/features/canvas/selection/selection_state.dart';
 import 'package:notee/features/canvas/widgets/canvas_view.dart';
 import 'package:notee/features/export/export_dialog.dart';
 import 'package:notee/features/import/image_importer.dart';
+import 'package:notee/features/import/pdf_render_cache.dart';
 import 'package:notee/features/library/library_screen.dart';
 import 'package:notee/features/library/library_state.dart';
 import 'package:notee/features/lock/note_lock_service.dart';
@@ -48,7 +52,15 @@ import 'package:notee/theme/notee_theme.dart';
 import 'package:spen_remote/spen_remote.dart';
 import 'package:notee/features/canvas/engine/spen_state.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Restore the user's PDF render thread count setting before any rendering
+  // jobs start.
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final n = prefs.getInt('pdf_render_threads');
+    if (n != null) PdfRenderCache.instance.setMaxConcurrent(n);
+  } catch (_) {}
   runApp(const ProviderScope(child: NoteeApp()));
 }
 
@@ -858,6 +870,13 @@ class _EditorTopBarState extends ConsumerState<_EditorTopBar> {
       ));
     } catch (e) {
       if (!mounted) return;
+      if (e is DioException && e.response?.statusCode == 401) {
+        await ref.read(authProvider.notifier).logout();
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('세션이 만료되었습니다. 다시 로그인해주세요.'),
+        ));
+        return;
+      }
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text('Sync failed: $e'),
         backgroundColor: Colors.red.shade700,
@@ -1453,6 +1472,13 @@ class _FloatingSideActionsState extends ConsumerState<_FloatingSideActions> {
       ));
     } catch (e) {
       if (!mounted) return;
+      if (e is DioException && e.response?.statusCode == 401) {
+        await ref.read(authProvider.notifier).logout();
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('세션이 만료되었습니다. 다시 로그인해주세요.'),
+        ));
+        return;
+      }
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text('Sync failed: $e'),
         backgroundColor: Colors.red.shade700,

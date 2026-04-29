@@ -37,4 +37,10 @@ class AssetService {
     final f = File(p.join(d.path, id));
     return await f.exists() ? f : null;
   }
+
+  /// Returns the expected local path for [id] (does not check existence).
+  Future<String> assetPath(String id) async {
+    final d = await _dir();
+    return p.join(d.path, id);
+  }
 }

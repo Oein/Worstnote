@@ -1,6 +1,7 @@
 // CloudSyncState — tracks server connectivity and auth state for the
 // cloud status button in the library header.
 
+import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../auth/auth_state.dart';
@@ -123,6 +124,15 @@ class CloudSyncNotifier extends Notifier<CloudSyncState> {
         onNoteId: (noteId) {
           state = state.copyWith(syncingNoteId: noteId);
         },
+        onNotePulled: () {
+          // Surface each pulled note immediately (DB only — assets still pending).
+          ref.read(libraryProvider.notifier).refresh();
+        },
+        onNoteAssetsReady: (_) {
+          // Refresh again so the freshly regenerated PDF/image cover
+          // thumbnail picks up.
+          ref.read(libraryProvider.notifier).refresh();
+        },
       );
       state = state.copyWith(
         status: CloudSyncStatus.ok,
@@ -140,6 +150,11 @@ class CloudSyncNotifier extends Notifier<CloudSyncState> {
         state = state.copyWith(status: CloudSyncStatus.idle);
       }
     } catch (e) {
+      // Both access and refresh tokens rejected → session is dead, auto-logout.
+      if (e is DioException && e.response?.statusCode == 401) {
+        await ref.read(authProvider.notifier).logout();
+        return;
+      }
       state = state.copyWith(
         status: CloudSyncStatus.error,
         errorMessage: e.toString(),

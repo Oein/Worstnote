@@ -103,10 +103,9 @@ class NoteeImporter {
       }
     }
 
-    // Pre-render every imported PDF page at all four scales in the
-    // background, so the canvas can show 200%+ immediately when opened
-    // (otherwise the user sees the 25% placeholder until each visible
-    // page is requested).
+    // Pre-render every imported PDF page at the three target scales in the
+    // background. Visible pages will jump to the head of the render queue
+    // via BackgroundImageLayer's `front: true` enqueue when the canvas opens.
     await _enqueuePdfRenders(pages);
 
     return NotebookState(

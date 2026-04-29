@@ -4,7 +4,7 @@
 // untyped Map<String, dynamic> so the server schema can evolve without
 // requiring code regeneration here.
 
-import 'dart:typed_data';
+import 'dart:io';
 
 import 'package:dio/dio.dart';
 
@@ -113,6 +113,15 @@ class ApiClient {
     return r.data as Map<String, dynamic>;
   }
 
+  /// Deletes [noteId] on the server (cascades pages/layers/objects/history).
+  /// Idempotent — returns normally even when the note is already gone.
+  Future<void> deleteNote(String noteId) async {
+    await _withAuthRetry(() => _dio.delete(
+          '/v1/sync/$noteId',
+          options: _bearerOpts(),
+        ));
+  }
+
   Future<Map<String, dynamic>> syncPull(String noteId, int since) async {
     final r = await _withAuthRetry(() => _dio.get(
           '/v1/sync/$noteId/pull',
@@ -137,43 +146,44 @@ class ApiClient {
     }
   }
 
-  /// Uploads raw bytes for [assetId]. No-ops if the server already has it.
-  Future<void> uploadAsset(String assetId, Uint8List bytes) async {
+  /// Uploads [file] for [assetId] as a streaming PUT (no full-memory copy).
+  Future<void> uploadAsset(String assetId, File file) async {
+    final length = await file.length();
     await _withAuthRetry(() => _dio.put(
           '/v1/assets/$assetId',
-          data: Stream.value(bytes),
+          data: file.openRead(),
           options: Options(
+            sendTimeout: const Duration(minutes: 10),
             headers: {
               'Content-Type': 'application/octet-stream',
-              'Content-Length': bytes.length,
-              ...?(_tokens != null
-                  ? {'authorization': 'Bearer ${_tokens!.accessToken}'}
-                  : null),
+              'Content-Length': length,
+              if (_tokens != null)
+                'authorization': 'Bearer ${_tokens!.accessToken}',
             },
             responseType: ResponseType.bytes,
           ),
         ));
   }
 
-  /// Downloads asset bytes for [assetId]. Returns null if not found.
-  Future<Uint8List?> downloadAsset(String assetId) async {
+  /// Downloads [assetId] directly to [savePath] (streaming, no memory copy).
+  /// Returns false if not found or on error.
+  Future<bool> downloadAssetToFile(String assetId, String savePath) async {
     try {
-      final r = await _withAuthRetry(() => _dio.get<dynamic>(
+      await _withAuthRetry(() => _dio.download(
             '/v1/assets/$assetId',
+            savePath,
             options: Options(
-              responseType: ResponseType.bytes,
+              receiveTimeout: const Duration(minutes: 10),
               headers: _tokens != null
                   ? {'authorization': 'Bearer ${_tokens!.accessToken}'}
                   : null,
             ),
           ));
-      final data = r.data;
-      if (data == null) return null;
-      if (data is Uint8List) return data;
-      if (data is List<int>) return Uint8List.fromList(data);
-      return null;
+      return true;
     } catch (_) {
-      return null;
+      // Clean up partial file on failure.
+      try { File(savePath).deleteSync(); } catch (_) {}
+      return false;
     }
   }
 

@@ -255,6 +255,31 @@ func (s *Service) ListNotes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"notes": notes})
 }
 
+// ───── Delete ─────────────────────────────────────────────────────────────
+
+// DeleteNote drops a note and all its dependent rows (pages, layers,
+// page_objects, sync_cursors, conflict_sessions, note_commits) via the
+// ON DELETE CASCADE foreign keys. Idempotent: returns 200 even when the
+// note no longer exists, so retries from the client tombstone queue
+// don't fail forever.
+func (s *Service) DeleteNote(w http.ResponseWriter, r *http.Request) {
+	c, _ := auth.ClaimsFromContext(r.Context())
+	noteID := chi.URLParam(r, "noteId")
+	if noteID == "" {
+		writeErr(w, http.StatusBadRequest, "bad_request", "missing noteId")
+		return
+	}
+	tag, err := s.DB.Exec(r.Context(),
+		`DELETE FROM notes WHERE id=$1 AND owner_id=$2`, noteID, c.UserID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "delete", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deleted": tag.RowsAffected(),
+	})
+}
+
 // ───── Push ───────────────────────────────────────────────────────────────
 
 func (s *Service) Push(w http.ResponseWriter, r *http.Request) {
