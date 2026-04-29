@@ -4,6 +4,8 @@
 // untyped Map<String, dynamic> so the server schema can evolve without
 // requiring code regeneration here.
 
+import 'dart:typed_data';
+
 import 'package:dio/dio.dart';
 
 class AuthTokens {
@@ -118,6 +120,61 @@ class ApiClient {
           options: _bearerOpts(),
         ));
     return r.data as Map<String, dynamic>;
+  }
+
+  // ── Assets (PDF/image files) ───────────────────────────────────────
+
+  /// Returns true when [assetId] already exists on the server.
+  Future<bool> assetExists(String assetId) async {
+    try {
+      await _withAuthRetry(() => _dio.head(
+            '/v1/assets/$assetId',
+            options: _bearerOpts(),
+          ));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Uploads raw bytes for [assetId]. No-ops if the server already has it.
+  Future<void> uploadAsset(String assetId, Uint8List bytes) async {
+    await _withAuthRetry(() => _dio.put(
+          '/v1/assets/$assetId',
+          data: Stream.value(bytes),
+          options: Options(
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': bytes.length,
+              ...?(_tokens != null
+                  ? {'authorization': 'Bearer ${_tokens!.accessToken}'}
+                  : null),
+            },
+            responseType: ResponseType.bytes,
+          ),
+        ));
+  }
+
+  /// Downloads asset bytes for [assetId]. Returns null if not found.
+  Future<Uint8List?> downloadAsset(String assetId) async {
+    try {
+      final r = await _withAuthRetry(() => _dio.get<dynamic>(
+            '/v1/assets/$assetId',
+            options: Options(
+              responseType: ResponseType.bytes,
+              headers: _tokens != null
+                  ? {'authorization': 'Bearer ${_tokens!.accessToken}'}
+                  : null,
+            ),
+          ));
+      final data = r.data;
+      if (data == null) return null;
+      if (data is Uint8List) return data;
+      if (data is List<int>) return Uint8List.fromList(data);
+      return null;
+    } catch (_) {
+      return null;
+    }
   }
 
   // ── History ────────────────────────────────────────────────────────

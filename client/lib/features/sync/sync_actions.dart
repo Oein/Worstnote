@@ -3,11 +3,13 @@
 // current state of every object, leveraging server-side LWW. P10 will add
 // proper delta tracking via a drift outbox table.
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../data/api/api_client.dart';
-import '../../data/db/repository.dart';
 import '../../domain/page_object.dart';
+import '../../domain/page_spec.dart';
+import '../import/asset_service.dart';
 import '../auth/auth_state.dart';
 import '../notebook/notebook_state.dart';
 
@@ -103,7 +105,59 @@ class SyncActions {
       'changes': changes,
     };
     await api.syncPush(s.note.id, body);
+
+    // Upload any PDF/image assets referenced by this note's pages.
+    await _uploadAssets(api, s.pages.map((p) => p.spec).toList());
+
     return (pushed: changes.length);
+  }
+
+  Future<void> _uploadAssets(ApiClient api, List<PageSpec> specs) async {
+    final assetService = AssetService();
+    for (final spec in specs) {
+      final bg = spec.background;
+      String? assetId;
+      if (bg is PdfBackground) assetId = bg.assetId;
+      if (bg is ImageBackground) assetId = bg.assetId;
+      if (assetId == null) continue;
+      try {
+        if (await api.assetExists(assetId)) continue;
+        final file = await assetService.fileFor(assetId);
+        if (file == null) continue;
+        final bytes = await file.readAsBytes();
+        await api.uploadAsset(assetId, bytes);
+        debugPrint('[Sync] uploaded asset $assetId (${bytes.length} bytes)');
+      } catch (e) {
+        debugPrint('[Sync] asset upload error $assetId: $e');
+      }
+    }
+  }
+
+  Future<void> _downloadAssets(ApiClient api, List<dynamic> pagesJson) async {
+    final assetService = AssetService();
+    for (final p in pagesJson) {
+      final pm = p as Map<String, dynamic>;
+      final specJson = pm['spec'];
+      if (specJson == null) continue;
+      try {
+        final spec = PageSpec.fromJson(
+          (specJson is Map) ? Map<String, dynamic>.from(specJson) : <String, dynamic>{},
+        );
+        final bg = spec.background;
+        String? assetId;
+        if (bg is PdfBackground) assetId = bg.assetId;
+        if (bg is ImageBackground) assetId = bg.assetId;
+        if (assetId == null) continue;
+        final existing = await assetService.fileFor(assetId);
+        if (existing != null) continue;
+        final bytes = await api.downloadAsset(assetId);
+        if (bytes == null) continue;
+        await assetService.putBytes(bytes, mime: 'application/octet-stream');
+        debugPrint('[Sync] downloaded asset $assetId (${bytes.length} bytes)');
+      } catch (e) {
+        debugPrint('[Sync] asset download error: $e');
+      }
+    }
   }
 
   Map<String, dynamic> _obj(
@@ -143,6 +197,7 @@ class SyncActions {
   // locally. [onProgress] is called after each note with (current, total).
   Future<({int pushed, int notes})> syncAllNotes({
     void Function(int current, int total)? onProgress,
+    void Function(String? noteId)? onNoteId,
   }) async {
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return (pushed: 0, notes: 0);
@@ -152,13 +207,21 @@ class SyncActions {
     final summaries = await repo.listNoteSummaries();
     final localIds = summaries.map((s) => s.id).toSet();
 
+    debugPrint('[Sync] local notes: ${summaries.length}');
+
     // Fetch server list upfront so we know the true total.
     List<Map<String, dynamic>> serverNotes = const [];
-    try { serverNotes = await api.listNotes(); } catch (_) {}
+    try {
+      serverNotes = await api.listNotes();
+      debugPrint('[Sync] server notes: ${serverNotes.length}');
+    } catch (e) {
+      debugPrint('[Sync] listNotes error: $e');
+    }
     final serverOnlyIds = serverNotes
         .map((s) => s['id'] as String)
         .where((id) => !localIds.contains(id))
         .toList();
+    debugPrint('[Sync] server-only ids to pull: ${serverOnlyIds.length} → $serverOnlyIds');
 
     final total = summaries.length + serverOnlyIds.length;
     int current = 0;
@@ -168,6 +231,7 @@ class SyncActions {
     // ── Push local notes ──────────────────────────────────────────────
     for (final s in summaries) {
       current++;
+      onNoteId?.call(s.id);
       onProgress?.call(current, total);
       final state = await repo.loadByNoteId(s.id);
       if (state == null) continue;
@@ -181,13 +245,22 @@ class SyncActions {
     // ── Pull server-only notes ────────────────────────────────────────
     for (final id in serverOnlyIds) {
       current++;
+      onNoteId?.call(id);
       onProgress?.call(current, total);
       try {
+        debugPrint('[Sync] pulling $id');
         final pullData = await api.syncPull(id, 0);
+        debugPrint('[Sync] pull ok, note=${pullData['note'] != null}, pages=${(pullData['pages'] as List?)?.length}, changes=${(pullData['changes'] as List?)?.length}');
         await repo.applyServerPull(pullData,
             ownerId: auth.tokens?.userId ?? '');
+        debugPrint('[Sync] applyServerPull ok for $id');
+        // Download PDF/image assets for pulled note's pages.
+        final pages = pullData['pages'] as List? ?? const [];
+        await _downloadAssets(api, pages);
         notes++;
-      } catch (_) {}
+      } catch (e, st) {
+        debugPrint('[Sync] pull/apply error for $id: $e\n$st');
+      }
     }
 
     return (pushed: pushed, notes: notes);

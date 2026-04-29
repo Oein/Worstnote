@@ -61,6 +61,10 @@ func NewRouter(d Deps) http.Handler {
 					r.Post("/sync/{noteId}/history/{commitId}/restore", d.Sync.HistoryRestore)
 					r.Get("/sync/{noteId}/conflicts/{sid}", d.Sync.GetConflict)
 					r.Post("/sync/{noteId}/conflicts/{sid}/resolve", d.Sync.ResolveConflict)
+					// Asset (PDF/image) upload/download
+					r.Head("/assets/{assetId}", d.Sync.HeadAsset)
+					r.Put("/assets/{assetId}", d.Sync.PutAsset)
+					r.Get("/assets/{assetId}", d.Sync.GetAsset)
 				}
 			})
 		}

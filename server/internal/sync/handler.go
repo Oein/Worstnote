@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -21,13 +23,86 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/oein/notee/server/internal/auth"
+	"github.com/oein/notee/server/internal/storage"
 )
 
 type Service struct {
-	DB *pgxpool.Pool
+	DB      *pgxpool.Pool
+	Storage *storage.Store
 }
 
 func NewService(db *pgxpool.Pool) *Service { return &Service{DB: db} }
+
+// ── Assets ────────────────────────────────────────────────────────────────
+
+var assetIDRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// PutAsset stores a binary asset (PDF/image) in S3 keyed by its SHA-256 hex id.
+// PUT /v1/assets/{assetId}
+func (s *Service) PutAsset(w http.ResponseWriter, r *http.Request) {
+	if s.Storage == nil {
+		writeErr(w, http.StatusNotImplemented, "no_storage", "asset storage not configured")
+		return
+	}
+	assetId := chi.URLParam(r, "assetId")
+	if !assetIDRe.MatchString(assetId) {
+		writeErr(w, http.StatusBadRequest, "bad_asset_id", "")
+		return
+	}
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	size := r.ContentLength
+	if err := s.Storage.Put(r.Context(), assetId, r.Body, size, ct); err != nil {
+		writeErr(w, http.StatusInternalServerError, "put_failed", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// GetAsset downloads an asset from S3.
+// GET /v1/assets/{assetId}
+func (s *Service) GetAsset(w http.ResponseWriter, r *http.Request) {
+	if s.Storage == nil {
+		writeErr(w, http.StatusNotImplemented, "no_storage", "asset storage not configured")
+		return
+	}
+	assetId := chi.URLParam(r, "assetId")
+	if !assetIDRe.MatchString(assetId) {
+		writeErr(w, http.StatusBadRequest, "bad_asset_id", "")
+		return
+	}
+	rc, size, err := s.Storage.Get(r.Context(), assetId)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not_found", err.Error())
+		return
+	}
+	defer rc.Close()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+	w.WriteHeader(http.StatusOK)
+	io.Copy(w, rc) //nolint:errcheck
+}
+
+// HeadAsset checks whether an asset exists without downloading it.
+// HEAD /v1/assets/{assetId}
+func (s *Service) HeadAsset(w http.ResponseWriter, r *http.Request) {
+	if s.Storage == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		return
+	}
+	assetId := chi.URLParam(r, "assetId")
+	if !assetIDRe.MatchString(assetId) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if s.Storage.Exists(r.Context(), assetId) {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
 
 // ───── Wire types ────────────────────────────────────────────────────────
 

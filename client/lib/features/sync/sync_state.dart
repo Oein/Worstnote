@@ -26,6 +26,7 @@ class CloudSyncState {
     this.lastSyncTotal,
     this.syncCurrent,
     this.syncTotal,
+    this.syncingNoteId,
   });
 
   final CloudSyncStatus status;
@@ -36,6 +37,7 @@ class CloudSyncState {
   final int? lastSyncTotal;   // total notes processed in last sync
   final int? syncCurrent;     // notes done so far in active sync
   final int? syncTotal;       // total notes in active sync
+  final String? syncingNoteId; // note ID currently being pushed/pulled
 
   CloudSyncState copyWith({
     CloudSyncStatus? status,
@@ -46,6 +48,7 @@ class CloudSyncState {
     int? lastSyncTotal,
     int? syncCurrent,
     int? syncTotal,
+    String? syncingNoteId,
   }) => CloudSyncState(
     status: status ?? this.status,
     errorMessage: errorMessage,
@@ -55,6 +58,7 @@ class CloudSyncState {
     lastSyncTotal: lastSyncTotal ?? this.lastSyncTotal,
     syncCurrent: syncCurrent ?? this.syncCurrent,
     syncTotal: syncTotal ?? this.syncTotal,
+    syncingNoteId: syncingNoteId,
   );
 }
 
@@ -116,6 +120,9 @@ class CloudSyncNotifier extends Notifier<CloudSyncState> {
         onProgress: (current, total) {
           state = state.copyWith(syncCurrent: current, syncTotal: total);
         },
+        onNoteId: (noteId) {
+          state = state.copyWith(syncingNoteId: noteId);
+        },
       );
       state = state.copyWith(
         status: CloudSyncStatus.ok,
@@ -124,6 +131,7 @@ class CloudSyncNotifier extends Notifier<CloudSyncState> {
         lastSyncTotal: r.notes,
         syncCurrent: null,
         syncTotal: null,
+        syncingNoteId: null,
       );
       // Refresh library so newly pulled notes become visible.
       await ref.read(libraryProvider.notifier).refresh();
@@ -137,6 +145,7 @@ class CloudSyncNotifier extends Notifier<CloudSyncState> {
         errorMessage: e.toString(),
         syncCurrent: null,
         syncTotal: null,
+        syncingNoteId: null,
       );
     }
   }

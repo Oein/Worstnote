@@ -2178,10 +2178,10 @@ class _NotebookCover extends ConsumerWidget {
                     child: Stack(children: [
                     Positioned.fill(child: _CoverContent(note: note)),
                     // Cloud sync badge — top-left corner.
-                    const Positioned(
+                    Positioned(
                       left: 6,
                       top: 6,
-                      child: _CloudBadge(),
+                      child: _CloudBadge(noteId: note.id),
                     ),
                     // Favorite star — top-right corner.
                     Positioned(
@@ -3336,7 +3336,8 @@ class _CloudButtonState extends ConsumerState<_CloudButton>
 // ─── Cloud badge on note thumbnails ──────────────────────────────────────
 
 class _CloudBadge extends ConsumerStatefulWidget {
-  const _CloudBadge();
+  const _CloudBadge({required this.noteId});
+  final String noteId;
 
   @override
   ConsumerState<_CloudBadge> createState() => _CloudBadgeState();
@@ -3367,51 +3368,30 @@ class _CloudBadgeState extends ConsumerState<_CloudBadge>
 
     if (cloud.status == CloudSyncStatus.notLoggedIn) return const SizedBox.shrink();
 
-    if (cloud.status == CloudSyncStatus.syncing ||
-        cloud.status == CloudSyncStatus.checking) {
+    // This note is actively being synced right now.
+    final isThisNoteSyncing = cloud.status == CloudSyncStatus.syncing &&
+        cloud.syncingNoteId == widget.noteId;
+
+    if (isThisNoteSyncing || cloud.status == CloudSyncStatus.checking) {
       if (!_spin.isAnimating) _spin.repeat();
     } else {
       if (_spin.isAnimating) _spin.stop();
     }
 
-    final icon = switch (cloud.status) {
-      CloudSyncStatus.notLoggedIn => Icons.cloud_outlined,
-      CloudSyncStatus.idle        => Icons.cloud,
-      CloudSyncStatus.checking    => Icons.sync,
-      CloudSyncStatus.syncing     => Icons.sync,
-      CloudSyncStatus.ok          => Icons.cloud_done,
-      CloudSyncStatus.error       => Icons.cloud_off,
-    };
-
-    Widget iconWidget = Icon(icon, size: 12, color: Colors.white.withValues(alpha: 0.9));
-    if (cloud.status == CloudSyncStatus.syncing ||
-        cloud.status == CloudSyncStatus.checking) {
-      iconWidget = RotationTransition(turns: _spin, child: iconWidget);
+    final IconData icon;
+    if (isThisNoteSyncing || cloud.status == CloudSyncStatus.checking) {
+      icon = Icons.sync;
+    } else if (cloud.status == CloudSyncStatus.error) {
+      icon = Icons.cloud_off;
+    } else if (cloud.status == CloudSyncStatus.ok) {
+      icon = Icons.cloud_done;
+    } else {
+      icon = Icons.cloud;
     }
 
-    final showProgress = cloud.status == CloudSyncStatus.syncing &&
-        cloud.syncTotal != null && cloud.syncTotal! > 0;
-
-    if (showProgress) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.45),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          iconWidget,
-          const SizedBox(width: 4),
-          Text(
-            '${cloud.syncCurrent ?? 0}/${cloud.syncTotal}',
-            style: const TextStyle(
-              color: Colors.white70,
-              fontFamily: 'Inter Tight',
-              fontSize: 10,
-            ),
-          ),
-        ]),
-      );
+    Widget iconWidget = Icon(icon, size: 12, color: Colors.white.withValues(alpha: 0.9));
+    if (isThisNoteSyncing || cloud.status == CloudSyncStatus.checking) {
+      iconWidget = RotationTransition(turns: _spin, child: iconWidget);
     }
 
     return Container(

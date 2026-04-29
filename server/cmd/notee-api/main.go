@@ -15,6 +15,7 @@ import (
 	"github.com/oein/notee/server/internal/db"
 	httpapi "github.com/oein/notee/server/internal/http"
 	syncpkg "github.com/oein/notee/server/internal/sync"
+	"github.com/oein/notee/server/internal/storage"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -42,6 +43,17 @@ func main() {
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTokenTTL)
 	authSvc := auth.NewService(pool, issuer, cfg.RefreshTokenTTL)
 	syncSvc := syncpkg.NewService(pool)
+
+	// Wire asset storage (MinIO). Non-fatal if unavailable — assets endpoints
+	// return 501 when Storage is nil, so the rest of the API keeps working.
+	if store, err := storage.New(
+		cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Bucket, cfg.S3UseSSL,
+	); err != nil {
+		log.Warn().Err(err).Msg("asset storage unavailable — PDF/image sync disabled")
+	} else {
+		syncSvc.Storage = store
+		log.Info().Str("endpoint", cfg.S3Endpoint).Msg("asset storage connected")
+	}
 
 	router := httpapi.NewRouter(httpapi.Deps{
 		Now:    time.Now,
