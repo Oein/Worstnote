@@ -13,6 +13,8 @@
 
 import 'dart:io';
 import 'dart:math' as math;
+
+import 'package:flutter/services.dart';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -258,7 +260,10 @@ class _PageThumbnailItemState extends ConsumerState<_PageThumbnailItem> {
           GestureDetector(
             onTap: widget.onTap,
             onSecondaryTapUp: (d) => widget.onContextMenu(d.globalPosition),
-            onLongPressStart: (d) => widget.onContextMenu(d.globalPosition),
+            onLongPressStart: (d) {
+              HapticFeedback.mediumImpact();
+              widget.onContextMenu(d.globalPosition);
+            },
             child: Container(
               width: thumbW,
               height: thumbH,
@@ -358,14 +363,17 @@ class _PageThumbnailItemState extends ConsumerState<_PageThumbnailItem> {
                   ),
                 ),
               ),
-              ReorderableDragStartListener(
-                index: widget.index,
-                child: Padding(
-                  padding: const EdgeInsets.only(right: 2),
-                  child: Icon(
-                    Icons.drag_indicator,
-                    size: 13,
-                    color: t.inkFaint,
+              GestureDetector(
+                onPanDown: (_) => HapticFeedback.lightImpact(),
+                child: ReorderableDragStartListener(
+                  index: widget.index,
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 2),
+                    child: Icon(
+                      Icons.drag_indicator,
+                      size: 13,
+                      color: t.inkFaint,
+                    ),
                   ),
                 ),
               ),
