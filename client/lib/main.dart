@@ -124,6 +124,7 @@ class EditorScreen extends ConsumerStatefulWidget {
 class _EditorScreenState extends ConsumerState<EditorScreen>
     with TickerProviderStateMixin {
   bool _showPages = false;
+  bool _headerVisible = true;
   int _activePageIndex = 0;
   // Scalar zoom — visual scale applied via Transform.scale (no matrix translation).
   // On zoom, _scrollController offset is adjusted to keep the focal point anchored.
@@ -1035,25 +1036,42 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       body: SafeArea(
         bottom: false,
         top: hasStatusBar,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+        child: Stack(
           children: [
-            _EditorTopBar(
-              stylusOnly: stylusOnly,
-              showPages: _showPages,
-              activePageIndex: _activePageIndex,
-              totalPages: state.pages.length,
-              onTogglePages: _togglePages,
-              onBack: () => _closeEditor(),
-              onTitleChanged: ctl.setTitle,
-              onToggleStylusOnly: () => ref.read(toolProvider.notifier).setInputDrawMode(
-                stylusOnly ? InputDrawMode.any : InputDrawMode.stylusOnly,
+            Positioned.fill(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (_headerVisible)
+                    _EditorTopBar(
+                      noteId: note.id,
+                      stylusOnly: stylusOnly,
+                      showPages: _showPages,
+                      activePageIndex: _activePageIndex,
+                      totalPages: state.pages.length,
+                      onTogglePages: _togglePages,
+                      onBack: () => _closeEditor(),
+                      onTitleChanged: ctl.setTitle,
+                      onToggleStylusOnly: () => ref.read(toolProvider.notifier).setInputDrawMode(
+                        stylusOnly ? InputDrawMode.any : InputDrawMode.stylusOnly,
+                      ),
+                      onScrollToPage: (i) => _scrollerKey.currentState?.scrollToPage(i),
+                      onToggleHeader: () => setState(() => _headerVisible = false),
+                    ),
+                  if (dock == ToolbarDock.top) toolbar,
+                  canvasArea,
+                  if (dock == ToolbarDock.bottom) toolbar,
+                ],
               ),
-              onScrollToPage: (i) => _scrollerKey.currentState?.scrollToPage(i),
             ),
-            if (dock == ToolbarDock.top) toolbar,
-            canvasArea,
-            if (dock == ToolbarDock.bottom) toolbar,
+            if (!_headerVisible)
+              Positioned(
+                top: 8,
+                right: 8,
+                child: _FloatingHeaderRestoreBtn(
+                  onRestore: () => setState(() => _headerVisible = true),
+                ),
+              ),
           ],
         ),
       ),
@@ -1093,6 +1111,7 @@ class _HorizSyncController extends ScrollController {
 //            saved · undo · redo · stylus toggle · settings · search · share) ─
 class _EditorTopBar extends ConsumerStatefulWidget {
   const _EditorTopBar({
+    required this.noteId,
     required this.stylusOnly,
     required this.showPages,
     required this.activePageIndex,
@@ -1101,8 +1120,10 @@ class _EditorTopBar extends ConsumerStatefulWidget {
     required this.onBack,
     required this.onTitleChanged,
     required this.onToggleStylusOnly,
+    required this.onToggleHeader,
     this.onScrollToPage,
   });
+  final String noteId;
   final bool stylusOnly;
   final bool showPages;
   final int activePageIndex;
@@ -1111,6 +1132,7 @@ class _EditorTopBar extends ConsumerStatefulWidget {
   final VoidCallback onBack;
   final void Function(String) onTitleChanged;
   final VoidCallback onToggleStylusOnly;
+  final VoidCallback onToggleHeader;
   final void Function(int pageIndex)? onScrollToPage;
 
   @override
@@ -1285,13 +1307,18 @@ class _EditorTopBarState extends ConsumerState<_EditorTopBar> {
                 fontSize: 10,
                 color: t.inkFaint)),
         const SizedBox(width: 4),
+        IconButton(
+          tooltip: '전체화면',
+          icon: const Icon(Icons.fullscreen, size: 20),
+          onPressed: widget.onToggleHeader,
+        ),
+        _EditorCloudButton(noteId: widget.noteId, onSyncNow: _syncBusy ? null : _syncNow),
         _NoteSettingsBtn(
           stylusOnly: widget.stylusOnly,
           onToggleStylusOnly: widget.onToggleStylusOnly,
           onExport: _share,
           exporting: _exporting,
         ),
-        _EditorCloudButton(onSyncNow: _syncBusy ? null : _syncNow),
       ]),
     );
   }
@@ -1741,7 +1768,10 @@ class _FloatingSideActionsState extends ConsumerState<_FloatingSideActions> {
       child: Padding(
         padding: const EdgeInsets.all(4),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          _EditorCloudButton(onSyncNow: _busy ? null : _syncNow),
+          _EditorCloudButton(
+            noteId: ref.watch(notebookProvider).note.id,
+            onSyncNow: _busy ? null : _syncNow,
+          ),
         ]),
       ),
     );
@@ -1836,7 +1866,8 @@ class _CanvasCloudStatus extends ConsumerWidget {
 // ─── Editor Cloud Button ───────────────────────────────────────────────────
 
 class _EditorCloudButton extends ConsumerStatefulWidget {
-  const _EditorCloudButton({required this.onSyncNow});
+  const _EditorCloudButton({required this.noteId, required this.onSyncNow});
+  final String noteId;
   final VoidCallback? onSyncNow;
 
   @override
@@ -1866,37 +1897,53 @@ class _EditorCloudButtonState extends ConsumerState<_EditorCloudButton>
   Widget build(BuildContext context) {
     final t = NoteeProvider.of(context).tokens;
     final cloud = ref.watch(cloudSyncProvider);
+    final conflicts = ref.watch(pendingConflictsProvider);
+    final hasConflict = conflicts.containsKey(widget.noteId);
+    final isSyncingThis = cloud.status == CloudSyncStatus.syncing &&
+        (cloud.syncingNoteId == null || cloud.syncingNoteId == widget.noteId);
+    final isChecking = cloud.status == CloudSyncStatus.checking;
+    final spinning = isSyncingThis || isChecking;
 
-    if (cloud.status == CloudSyncStatus.checking ||
-        cloud.status == CloudSyncStatus.syncing) {
+    if (spinning) {
       if (!_spin.isAnimating) _spin.repeat();
     } else {
       if (_spin.isAnimating) _spin.stop();
     }
 
-    final (icon, color) = switch (cloud.status) {
-      CloudSyncStatus.notLoggedIn => (Icons.cloud_outlined, t.inkFaint),
-      CloudSyncStatus.idle        => (Icons.cloud,          t.inkDim),
-      CloudSyncStatus.checking    => (Icons.sync,           t.accent),
-      CloudSyncStatus.syncing     => (Icons.sync,           t.accent),
-      CloudSyncStatus.ok          => (Icons.cloud_done,     t.accent),
-      CloudSyncStatus.error       => (Icons.cloud_off,      t.inkFaint),
-    };
+    final IconData icon;
+    final Color color;
+    final String tooltip;
 
-    Widget iconWidget = Icon(icon, size: 18, color: color);
-    if (cloud.status == CloudSyncStatus.checking ||
-        cloud.status == CloudSyncStatus.syncing) {
-      iconWidget = RotationTransition(turns: _spin, child: iconWidget);
+    if (cloud.status == CloudSyncStatus.notLoggedIn) {
+      icon = Icons.cloud_outlined;
+      color = t.inkFaint;
+      tooltip = '로그인';
+    } else if (cloud.status == CloudSyncStatus.error) {
+      icon = Icons.cloud_off;
+      color = t.inkFaint;
+      tooltip = '오프라인';
+    } else if (hasConflict) {
+      icon = Icons.sync_problem;
+      color = Colors.orange;
+      tooltip = '충돌 발생';
+    } else if (spinning) {
+      icon = Icons.sync;
+      color = t.accent;
+      tooltip = isChecking ? '확인 중…' : '싱크 중…';
+    } else if (cloud.status == CloudSyncStatus.ok) {
+      icon = Icons.cloud_done;
+      color = t.accent;
+      tooltip = '싱크됨';
+    } else {
+      icon = Icons.cloud_done;
+      color = t.inkDim;
+      tooltip = '싱크됨';
     }
 
-    final tooltip = switch (cloud.status) {
-      CloudSyncStatus.notLoggedIn => '로그인',
-      CloudSyncStatus.idle        => '연결됨',
-      CloudSyncStatus.checking    => '확인 중…',
-      CloudSyncStatus.syncing     => '싱크 중…',
-      CloudSyncStatus.ok          => '연결됨',
-      CloudSyncStatus.error       => '오프라인',
-    };
+    Widget iconWidget = Icon(icon, size: 18, color: color);
+    if (spinning) {
+      iconWidget = RotationTransition(turns: _spin, child: iconWidget);
+    }
 
     return IconButton(
       tooltip: tooltip,
@@ -1909,6 +1956,33 @@ class _EditorCloudButtonState extends ConsumerState<_EditorCloudButton>
     await showDialog<void>(
       context: context,
       builder: (_) => _EditorCloudDialog(onSyncNow: widget.onSyncNow),
+    );
+  }
+}
+
+class _FloatingHeaderRestoreBtn extends StatelessWidget {
+  const _FloatingHeaderRestoreBtn({required this.onRestore});
+  final VoidCallback onRestore;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: Ink(
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.85),
+          shape: BoxShape.circle,
+          boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 6)],
+        ),
+        child: InkWell(
+          onTap: onRestore,
+          customBorder: const CircleBorder(),
+          child: const Padding(
+            padding: EdgeInsets.all(8),
+            child: Icon(Icons.fullscreen_exit, size: 20),
+          ),
+        ),
+      ),
     );
   }
 }
