@@ -38,3 +38,4 @@ server/bin/
 .env
 **/.env
 !**/.env.example
+/server/cmd/notee-api/notee-api

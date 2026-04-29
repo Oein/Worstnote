@@ -27,6 +27,12 @@ type Config struct {
 	JWTSecret      string
 	AccessTokenTTL time.Duration
 	RefreshTokenTTL time.Duration
+
+	// hCaptcha is enabled iff HCaptchaSecret is non-empty.
+	// HCaptchaSitekey is exposed to the client (it's public — the secret
+	// stays server-side and is sent to api.hcaptcha.com/siteverify).
+	HCaptchaSitekey string
+	HCaptchaSecret  string
 }
 
 // Load resolves Config from process environment with safe dev defaults.
@@ -47,6 +53,9 @@ func Load() (*Config, error) {
 		JWTSecret:       env("JWT_SECRET", "dev-only-not-secret"),
 		AccessTokenTTL:  envDuration("ACCESS_TOKEN_TTL", 15*time.Minute),
 		RefreshTokenTTL: envDuration("REFRESH_TOKEN_TTL", 30*24*time.Hour),
+
+		HCaptchaSitekey: env("HCAPTCHA_SITEKEY", ""),
+		HCaptchaSecret:  env("HCAPTCHA_SECRET", ""),
 	}
 
 	if c.JWTSecret == "dev-only-not-secret" && os.Getenv("APP_ENV") == "production" {

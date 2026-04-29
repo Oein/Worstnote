@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -20,16 +21,91 @@ type Service struct {
 	DB         *pgxpool.Pool
 	Issuer     *Issuer
 	RefreshTTL time.Duration
+
+	// hCaptcha. If HCaptchaSecret is non-empty, signup requires a
+	// captchaToken in the request body which is verified against
+	// api.hcaptcha.com/siteverify before the user row is created.
+	HCaptchaSitekey string
+	HCaptchaSecret  string
+
+	// HTTPClient used for hCaptcha verification. Tests inject a stub.
+	HTTPClient *http.Client
 }
 
 func NewService(db *pgxpool.Pool, issuer *Issuer, refreshTTL time.Duration) *Service {
-	return &Service{DB: db, Issuer: issuer, RefreshTTL: refreshTTL}
+	return &Service{
+		DB:         db,
+		Issuer:     issuer,
+		RefreshTTL: refreshTTL,
+		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+// CaptchaConfig is the public configuration the client fetches before
+// rendering the captcha widget. The secret never leaves the server.
+func (s *Service) CaptchaConfig(w http.ResponseWriter, r *http.Request) {
+	enabled := s.HCaptchaSecret != "" && s.HCaptchaSitekey != ""
+	resp := map[string]any{
+		"enabled":  enabled,
+		"provider": "hcaptcha",
+		"sitekey":  s.HCaptchaSitekey,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// verifyHCaptcha posts the token to api.hcaptcha.com/siteverify and returns
+// nil iff the response says success=true.
+func (s *Service) verifyHCaptcha(token, remoteIP string) error {
+	if s.HCaptchaSecret == "" {
+		return nil // captcha disabled — accept anything
+	}
+	if token == "" {
+		return errors.New("missing captcha token")
+	}
+	form := url.Values{}
+	form.Set("secret", s.HCaptchaSecret)
+	form.Set("response", token)
+	if s.HCaptchaSitekey != "" {
+		form.Set("sitekey", s.HCaptchaSitekey)
+	}
+	if remoteIP != "" {
+		form.Set("remoteip", remoteIP)
+	}
+	client := s.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	req, err := http.NewRequest(http.MethodPost,
+		"https://api.hcaptcha.com/siteverify",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Success    bool     `json:"success"`
+		ErrorCodes []string `json:"error-codes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return err
+	}
+	if !body.Success {
+		return errors.New("captcha rejected: " + strings.Join(body.ErrorCodes, ","))
+	}
+	return nil
 }
 
 type signupReq struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	DeviceID string `json:"deviceId"`
+	Email        string `json:"email"`
+	Password     string `json:"password"`
+	DeviceID     string `json:"deviceId"`
+	CaptchaToken string `json:"captchaToken"`
 }
 
 type tokenResp struct {
@@ -57,6 +133,13 @@ func (s *Service) Signup(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.DeviceID == "" {
 		writeErr(w, http.StatusBadRequest, "missing_device_id", "")
+		return
+	}
+	// hCaptcha verification — only enforced when HCaptchaSecret is set.
+	// Use X-Forwarded-For first hop if present (Caddy/reverse proxy).
+	if err := s.verifyHCaptcha(req.CaptchaToken, clientIP(r)); err != nil {
+		log.Warn().Err(err).Msg("captcha verification failed")
+		writeErr(w, http.StatusForbidden, "captcha_failed", err.Error())
 		return
 	}
 	hash, err := HashPassword(req.Password)
@@ -221,6 +304,25 @@ func hashBytes(s string) []byte {
 func sha256Hex(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+// clientIP extracts the most likely client IP from common proxy headers,
+// falling back to RemoteAddr. Used by captcha verification (remoteip arg).
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if comma := strings.IndexByte(v, ','); comma >= 0 {
+			return strings.TrimSpace(v[:comma])
+		}
+		return strings.TrimSpace(v)
+	}
+	if v := r.Header.Get("X-Real-IP"); v != "" {
+		return v
+	}
+	addr := r.RemoteAddr
+	if i := strings.LastIndexByte(addr, ':'); i >= 0 {
+		return addr[:i]
+	}
+	return addr
 }
 
 func validEmail(s string) bool {

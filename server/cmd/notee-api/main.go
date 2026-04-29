@@ -42,6 +42,11 @@ func main() {
 
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTokenTTL)
 	authSvc := auth.NewService(pool, issuer, cfg.RefreshTokenTTL)
+	authSvc.HCaptchaSitekey = cfg.HCaptchaSitekey
+	authSvc.HCaptchaSecret = cfg.HCaptchaSecret
+	if cfg.HCaptchaSecret != "" {
+		log.Info().Str("sitekey", cfg.HCaptchaSitekey).Msg("hCaptcha enabled for signup")
+	}
 	syncSvc := syncpkg.NewService(pool)
 
 	// Wire asset storage (MinIO). Non-fatal if unavailable — assets endpoints

@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../theme/notee_theme.dart';
 import '../sync/sync_state.dart';
 import 'auth_state.dart';
+import 'hcaptcha_dialog.dart';
 
 class LoginDialog extends ConsumerStatefulWidget {
   const LoginDialog({super.key});
@@ -43,7 +44,27 @@ class _LoginDialogState extends ConsumerState<LoginDialog> {
       await ref.read(authProvider.notifier).setServerUrl(_server.text.trim());
       final ctl = ref.read(authProvider.notifier);
       if (_signupMode) {
-        await ctl.signup(_email.text.trim(), _password.text);
+        // Server-driven captcha gate. We fetch config every time so a server
+        // toggling the requirement doesn't need a client redeploy.
+        String? captchaToken;
+        final cfg = await ctl.captchaConfig();
+        if (cfg != null && cfg['enabled'] == true) {
+          final sitekey = (cfg['sitekey'] as String?) ?? '';
+          if (sitekey.isEmpty) {
+            throw Exception('Server requires captcha but did not provide a sitekey');
+          }
+          if (!mounted) return;
+          captchaToken = await HCaptchaDialog.show(context, sitekey: sitekey);
+          if (captchaToken == null) {
+            setState(() {
+              _error = 'Captcha cancelled';
+              _busy = false;
+            });
+            return;
+          }
+        }
+        await ctl.signup(_email.text.trim(), _password.text,
+            captchaToken: captchaToken);
       } else {
         await ctl.login(_email.text.trim(), _password.text);
       }

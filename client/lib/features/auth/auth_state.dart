@@ -14,7 +14,7 @@ import '../../data/secure_kv.dart';
 const _storeKeyTokens = 'notee.auth.tokens';
 const _storeKeyServer = 'notee.auth.server';
 const _storeKeyDevice = 'notee.auth.device';
-const _defaultServer = 'http://localhost:8080';
+const _defaultServer = 'https://worstnote.oein.kr';
 
 class AuthState {
   AuthState({
@@ -61,16 +61,30 @@ class AuthController extends AsyncNotifier<AuthState> {
     ));
   }
 
-  Future<void> signup(String email, String password) async {
+  Future<void> signup(String email, String password,
+      {String? captchaToken}) async {
     final s = state.value ?? await build();
     final api = _newClient(s);
-    await api.signup(email, password);
+    await api.signup(email, password, captchaToken: captchaToken);
     await _persistTokens(api.tokens);
     state = AsyncData(AuthState(
       serverUrl: s.serverUrl,
       deviceId: s.deviceId,
       tokens: api.tokens,
     ));
+  }
+
+  /// Fetches the server's captcha config (enabled + sitekey).
+  /// Used by the login dialog before showing signup. Returns null on error
+  /// so the dialog falls back to the legacy no-captcha behaviour.
+  Future<Map<String, dynamic>?> captchaConfig() async {
+    final s = state.value ?? await build();
+    final api = _newClient(s);
+    try {
+      return await api.captchaConfig();
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> login(String email, String password) async {

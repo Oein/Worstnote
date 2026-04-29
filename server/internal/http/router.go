@@ -40,6 +40,7 @@ func NewRouter(d Deps) http.Handler {
 		r.Get("/health", healthHandler(d))
 
 		if d.Auth != nil {
+			r.Get("/auth/captcha", d.Auth.CaptchaConfig)
 			r.Post("/auth/signup", d.Auth.Signup)
 			r.Post("/auth/login", d.Auth.Login)
 			r.Post("/auth/refresh", d.Auth.Refresh)

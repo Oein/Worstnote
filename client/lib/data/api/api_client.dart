@@ -59,11 +59,20 @@ class ApiClient {
   }
 
   // ── Auth ───────────────────────────────────────────────────────────
-  Future<AuthTokens> signup(String email, String password) async {
+  /// Server-driven captcha config. Returns `{enabled, sitekey, provider}`.
+  /// Client should fetch this before showing the signup form.
+  Future<Map<String, dynamic>> captchaConfig() async {
+    final r = await _dio.get<Map<String, dynamic>>('/v1/auth/captcha');
+    return r.data as Map<String, dynamic>;
+  }
+
+  Future<AuthTokens> signup(String email, String password,
+      {String? captchaToken}) async {
     final r = await _dio.post<Map<String, dynamic>>('/v1/auth/signup', data: {
       'email': email,
       'password': password,
       'deviceId': deviceId,
+      if (captchaToken != null) 'captchaToken': captchaToken,
     });
     return _decodeTokens(r.data as Map<String, dynamic>);
   }

@@ -57,6 +57,9 @@ dependencies:
   syncfusion_flutter_pdf: ^33.2.3
   spen_remote: ^0.0.4
 
+  # WebView for hCaptcha challenge during signup.
+  webview_flutter: ^4.7.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
