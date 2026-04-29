@@ -187,9 +187,36 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
   _LibFilter _filter = _LibFilter.all;
   Timer? _syncPollingTimer;
 
+  // ── Persistence keys
+  static const _kGridView  = 'library.isGridView';
+  static const _kSortOrder = 'library.sortOrder';
+
+  Future<void> _loadPrefs() async {
+    final p = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _isGridView  = p.getBool(_kGridView) ?? true;
+      _sortOrder   = _SortOrder.values.firstWhere(
+        (s) => s.name == p.getString(_kSortOrder),
+        orElse: () => _SortOrder.updatedAt,
+      );
+    });
+  }
+
+  Future<void> _saveGridView(bool v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kGridView, v);
+  }
+
+  Future<void> _saveSortOrder(_SortOrder s) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString(_kSortOrder, s.name);
+  }
+
   @override
   void initState() {
     super.initState();
+    _loadPrefs();
     // Schedule thumbnail generation for any notes that don't have a cached cover.
     // Runs in the background (serial queue), never blocks the UI.
     WidgetsBinding.instance.addPostFrameCallback((_) => _scheduleMissingThumbnails());
@@ -289,8 +316,14 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
             isGridView: _isGridView,
             sortOrder: _sortOrder,
             onSearch: (v) => setState(() => _searchQuery = v),
-            onToggleView: () => setState(() => _isGridView = !_isGridView),
-            onSortChanged: (s) => setState(() => _sortOrder = s),
+            onToggleView: () {
+              setState(() => _isGridView = !_isGridView);
+              _saveGridView(_isGridView);
+            },
+            onSortChanged: (s) {
+              setState(() => _sortOrder = s);
+              _saveSortOrder(s);
+            },
           ),
           Expanded(
             child: Row(
