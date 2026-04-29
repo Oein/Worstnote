@@ -1,4 +1,4 @@
-// HTTP client for the Notee API. Wraps dio with auto refresh-on-401.
+// HTTP client for the Notee API.
 //
 // Wire format mirrors `shared/docs/SYNC.md`. The push/pull payloads are
 // untyped Map<String, dynamic> so the server schema can evolve without
@@ -12,19 +12,16 @@ class AuthTokens {
   AuthTokens({
     required this.userId,
     required this.accessToken,
-    required this.refreshToken,
     required this.expiresAt,
   });
   final String userId;
   String accessToken;
-  String refreshToken;
   DateTime expiresAt;
 }
 
 typedef OnTokens = void Function(AuthTokens tokens);
 
-/// Called when a refresh attempt fails with 401 — the server has invalidated
-/// the refresh token (e.g. it was already rotated). The caller should clear
+/// Called on 401 — the token is invalid or expired. The caller should clear
 /// auth state so the user is prompted to re-login.
 typedef OnLogout = void Function();
 
@@ -81,16 +78,6 @@ class ApiClient {
     final r = await _dio.post<Map<String, dynamic>>('/v1/auth/login', data: {
       'email': email,
       'password': password,
-      'deviceId': deviceId,
-    });
-    return _decodeTokens(r.data as Map<String, dynamic>);
-  }
-
-  Future<AuthTokens> refresh() async {
-    final t = _tokens;
-    if (t == null) throw StateError('not authenticated');
-    final r = await _dio.post<Map<String, dynamic>>('/v1/auth/refresh', data: {
-      'refreshToken': t.refreshToken,
       'deviceId': deviceId,
     });
     return _decodeTokens(r.data as Map<String, dynamic>);
@@ -296,7 +283,6 @@ class ApiClient {
     final t = AuthTokens(
       userId: json['userId'] as String,
       accessToken: json['accessToken'] as String,
-      refreshToken: json['refreshToken'] as String,
       expiresAt: DateTime.now().toUtc().add(
             Duration(seconds: (json['expiresIn'] as num).toInt()),
           ),
@@ -311,19 +297,8 @@ class ApiClient {
       return await fn();
     } on DioException catch (e) {
       if (e.response?.statusCode == 401 && _tokens != null) {
-        try {
-          await refresh();
-        } on DioException catch (re) {
-          // Refresh itself failed — the refresh token is invalid (rotated away
-          // or expired on the server). Clear local tokens so the user is
-          // prompted to re-login rather than seeing repeated 401 errors.
-          if (re.response?.statusCode == 401 || re.response?.statusCode == 403) {
-            setTokens(null);
-            onLogout?.call();
-          }
-          rethrow;
-        }
-        return await fn();
+        setTokens(null);
+        onLogout?.call();
       }
       rethrow;
     }

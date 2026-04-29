@@ -26,7 +26,6 @@ type Config struct {
 
 	JWTSecret      string
 	AccessTokenTTL time.Duration
-	RefreshTokenTTL time.Duration
 
 	// hCaptcha is enabled iff HCaptchaSecret is non-empty.
 	// HCaptchaSitekey is exposed to the client (it's public — the secret
@@ -50,9 +49,8 @@ func Load() (*Config, error) {
 		S3SecretKey: env("S3_SECRET_KEY", "minioadmin"),
 		S3UseSSL:    envBool("S3_USE_SSL", false),
 
-		JWTSecret:       env("JWT_SECRET", "dev-only-not-secret"),
-		AccessTokenTTL:  envDuration("ACCESS_TOKEN_TTL", 15*time.Minute),
-		RefreshTokenTTL: envDuration("REFRESH_TOKEN_TTL", 30*24*time.Hour),
+		JWTSecret:      env("JWT_SECRET", "dev-only-not-secret"),
+		AccessTokenTTL: envDuration("ACCESS_TOKEN_TTL", 365*24*time.Hour),
 
 		HCaptchaSitekey: env("HCAPTCHA_SITEKEY", ""),
 		HCaptchaSecret:  env("HCAPTCHA_SECRET", ""),

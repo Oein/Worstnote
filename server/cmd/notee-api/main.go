@@ -41,7 +41,7 @@ func main() {
 	log.Info().Msg("postgres connected")
 
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTokenTTL)
-	authSvc := auth.NewService(pool, issuer, cfg.RefreshTokenTTL)
+	authSvc := auth.NewService(pool, issuer)
 	authSvc.HCaptchaSitekey = cfg.HCaptchaSitekey
 	authSvc.HCaptchaSecret = cfg.HCaptchaSecret
 	if cfg.HCaptchaSecret != "" {
