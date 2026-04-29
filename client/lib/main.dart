@@ -144,6 +144,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   StreamSubscription<dynamic>? _spenSub;
   StreamSubscription<dynamic>? _lockHandoffSub;
   String? _myNoteId;
+  Timer? _autoSyncTimer;
+  bool _autoSyncing = false;
 
   @override
   void initState() {
@@ -159,6 +161,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     HardwareKeyboard.instance.addHandler(_hardwareKeyHandler);
     _initSpen();
     _initLock();
+    _startAutoSync();
     // Hide the Android system navigation bar while editing so the bottom
     // toolbar dock isn't covered by it. Swipe from the edge restores it.
     SystemChrome.setEnabledSystemUIMode(
@@ -264,6 +267,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     ref.read(currentNoteIdProvider.notifier).state = null;
     // 4. Refresh library in the background (no longer awaited).
     libraryCtl.refresh();
+    // 5. Push the just-edited note to server in the background.
+    unawaited(ref.read(syncActionsProvider).pushNote(noteId));
   }
 
   Future<void> _initSpen() async {
@@ -280,6 +285,21 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     }
   }
 
+  void _startAutoSync() {
+    _autoSyncTimer?.cancel();
+    _autoSyncTimer = Timer.periodic(const Duration(minutes: 1), (_) async {
+      if (_autoSyncing) return;
+      final auth = ref.read(authProvider).value;
+      if (auth == null || !auth.isLoggedIn) return;
+      _autoSyncing = true;
+      try {
+        await ref.read(syncActionsProvider).syncNow();
+      } catch (_) {} finally {
+        _autoSyncing = false;
+      }
+    });
+  }
+
   @override
   void deactivate() {
     // Called before dispose while ref is still valid — release lock + flush save.
@@ -293,6 +313,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   @override
   void dispose() {
+    _autoSyncTimer?.cancel();
     HardwareKeyboard.instance.removeHandler(_hardwareKeyHandler);
     _scrollController.dispose();
     _horizScrollController.dispose();

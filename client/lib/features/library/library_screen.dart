@@ -136,6 +136,7 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
   bool _isGridView = true;
   _SortOrder _sortOrder = _SortOrder.updatedAt;
   _LibFilter _filter = _LibFilter.all;
+  Timer? _syncPollingTimer;
 
   @override
   void initState() {
@@ -143,6 +144,21 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
     // Schedule thumbnail generation for any notes that don't have a cached cover.
     // Runs in the background (serial queue), never blocks the UI.
     WidgetsBinding.instance.addPostFrameCallback((_) => _scheduleMissingThumbnails());
+    // Poll server every 30 seconds for new/changed notes.
+    _syncPollingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      final auth = ref.read(authProvider).value;
+      if (auth == null || !auth.isLoggedIn) return;
+      final cloud = ref.read(cloudSyncProvider);
+      if (cloud.status == CloudSyncStatus.syncing ||
+          cloud.status == CloudSyncStatus.checking) return;
+      ref.read(cloudSyncProvider.notifier).syncAll();
+    });
+  }
+
+  @override
+  void dispose() {
+    _syncPollingTimer?.cancel();
+    super.dispose();
   }
 
   @override

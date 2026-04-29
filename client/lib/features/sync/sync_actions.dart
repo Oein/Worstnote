@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../data/api/api_client.dart';
+import '../../data/db/repository.dart';
 import '../../domain/page_object.dart';
 import '../../domain/page_spec.dart';
 import '../import/asset_service.dart';
@@ -28,7 +29,10 @@ class SyncActions {
   SyncActions(this.ref);
   final Ref ref;
 
-  Future<SyncResult> syncNow() async {
+  // Tracks last server cursor per noteId for incremental pulls.
+  final Map<String, int> _pullCursors = {};
+
+  Future<SyncResult> syncNow({int? since}) async {
     final auth = ref.read(authProvider).value;
     if (auth == null || auth.tokens == null) {
       throw StateError('Not logged in');
@@ -36,12 +40,29 @@ class SyncActions {
     final api = apiFor(auth);
     final notebook = ref.read(notebookProvider);
     final pushed = await _push(api, notebook);
-    final pulled = await _pull(api, notebook);
+    final effectiveSince = since ?? _pullCursors[notebook.note.id] ?? 0;
+    final pulled = await _pull(api, notebook, since: effectiveSince);
+    _pullCursors[notebook.note.id] = pulled.cursor;
     return SyncResult(
       pushed: pushed.pushed,
       pulled: pulled.pulled,
       cursor: pulled.cursor,
     );
+  }
+
+  /// Silently push a single note by id. Does nothing if not logged in.
+  Future<void> pushNote(String noteId) async {
+    final auth = ref.read(authProvider).value;
+    if (auth == null || !auth.isLoggedIn) return;
+    final api = apiFor(auth);
+    final repo = ref.read(repositoryProvider);
+    final state = await repo.loadByNoteId(noteId);
+    if (state == null) return;
+    try {
+      await _push(api, state);
+    } catch (e) {
+      debugPrint('[Sync] background push error for $noteId: $e');
+    }
   }
 
   Future<({int pushed})> _push(ApiClient api, NotebookState s) async {
@@ -187,10 +208,10 @@ class SyncActions {
   }
 
   Future<({int pulled, int cursor})> _pull(
-      ApiClient api, NotebookState s) async {
-    final r = await api.syncPull(s.note.id, 0);
+      ApiClient api, NotebookState s, {int since = 0}) async {
+    final r = await api.syncPull(s.note.id, since);
     final changes = (r['changes'] as List?) ?? const [];
-    return (pulled: changes.length, cursor: (r['cursor'] as num?)?.toInt() ?? 0);
+    return (pulled: changes.length, cursor: (r['cursor'] as num?)?.toInt() ?? since);
   }
 
   // Pushes every local note to the server, then pulls any server notes missing
