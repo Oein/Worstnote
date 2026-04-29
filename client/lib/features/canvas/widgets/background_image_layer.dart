@@ -86,7 +86,17 @@ class _BackgroundImageLayerState extends State<BackgroundImageLayer> {
     };
     if (id == null) return;
 
-    final f = await AssetService().fileFor(id);
+    var f = await AssetService().fileFor(id);
+    // Drop empty/zero-byte assets — they're leftovers from interrupted
+    // downloads, and feeding them to pdfium / Image.file would crash.
+    if (f != null) {
+      try {
+        if (await f.length() == 0) {
+          await f.delete();
+          f = null;
+        }
+      } catch (_) {}
+    }
     if (!mounted) return;
 
     if (bg is ImageBackground) {

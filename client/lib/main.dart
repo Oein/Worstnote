@@ -31,6 +31,7 @@ import 'package:notee/features/canvas/scroll/page_scroller.dart';
 import 'package:notee/features/canvas/selection/selection_state.dart';
 import 'package:notee/features/canvas/widgets/canvas_view.dart';
 import 'package:notee/features/export/export_dialog.dart';
+import 'package:notee/features/import/asset_service.dart';
 import 'package:notee/features/import/image_importer.dart';
 import 'package:notee/features/import/pdf_render_cache.dart';
 import 'package:notee/features/library/library_screen.dart';
@@ -60,6 +61,13 @@ void main() async {
     final prefs = await SharedPreferences.getInstance();
     final n = prefs.getInt('pdf_render_threads');
     if (n != null) PdfRenderCache.instance.setMaxConcurrent(n);
+  } catch (_) {}
+  // Sweep any half-downloaded asset files left behind by a process kill
+  // during the previous run. A leftover .partial — or a 0-byte final file
+  // from a Dio error path that didn't finish — would otherwise be treated
+  // as a complete asset on next sync and crash the PDF renderer.
+  try {
+    await AssetService().cleanupPartialDownloads();
   } catch (_) {}
   runApp(const ProviderScope(child: NoteeApp()));
 }
@@ -157,6 +165,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   StreamSubscription<dynamic>? _lockHandoffSub;
   String? _myNoteId;
   Timer? _autoSyncTimer;
+  Timer? _commitTimer;
   bool _autoSyncing = false;
 
   @override
@@ -174,6 +183,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     _initSpen();
     _initLock();
     _startAutoSync();
+    _startCommitTimer();
     // Hide the Android system navigation bar while editing so the bottom
     // toolbar dock isn't covered by it. Swipe from the edge restores it.
     SystemChrome.setEnabledSystemUIMode(
@@ -279,8 +289,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     ref.read(currentNoteIdProvider.notifier).state = null;
     // 4. Refresh library in the background (no longer awaited).
     libraryCtl.refresh();
-    // 5. Push the just-edited note to server in the background.
-    unawaited(ref.read(syncActionsProvider).pushNote(noteId));
+    // 5. Push final state, then seal the editing session into a commit.
+    //    Both run in the background so navigation isn't blocked.
+    unawaited(() async {
+      await ref.read(syncActionsProvider).pushNote(noteId);
+      await ref.read(syncActionsProvider).commitNote(noteId);
+    }());
   }
 
   Future<void> _initSpen() async {
@@ -312,6 +326,26 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     });
   }
 
+  /// Every 3 minutes during editing, ask the server to seal pending
+  /// revisions into a labeled commit. The actual commit is a server-side
+  /// no-op if nothing was pushed since the last commit, so this is cheap
+  /// to fire on a fixed cadence.
+  void _startCommitTimer() {
+    _commitTimer?.cancel();
+    _commitTimer = Timer.periodic(const Duration(minutes: 3), (_) async {
+      final noteId = ref.read(currentNoteIdProvider);
+      if (noteId == null) return;
+      final auth = ref.read(authProvider).value;
+      if (auth == null || !auth.isLoggedIn) return;
+      try {
+        // Flush any pending local changes first so the commit captures them.
+        await ref.read(notebookProvider.notifier).flushDebounce();
+        await ref.read(syncActionsProvider).pushNote(noteId);
+        await ref.read(syncActionsProvider).commitNote(noteId);
+      } catch (_) {}
+    });
+  }
+
   @override
   void deactivate() {
     // Called before dispose while ref is still valid — release lock + flush save.
@@ -326,6 +360,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   @override
   void dispose() {
     _autoSyncTimer?.cancel();
+    _commitTimer?.cancel();
     HardwareKeyboard.instance.removeHandler(_hardwareKeyHandler);
     _scrollController.dispose();
     _horizScrollController.dispose();

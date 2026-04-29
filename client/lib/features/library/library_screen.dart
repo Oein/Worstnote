@@ -161,6 +161,12 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
     // or that another window started but didn't finish.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(syncActionsProvider).resumeAssetDownloads();
+      // Kick off an immediate sync so notes added on other devices show up
+      // without waiting for the next polling tick.
+      final auth = ref.read(authProvider).value;
+      if (auth != null && auth.isLoggedIn) {
+        ref.read(cloudSyncProvider.notifier).syncAll();
+      }
     });
     // Poll server every 30 seconds for new/changed notes.
     _syncPollingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
@@ -933,6 +939,18 @@ class _MenuPopover extends StatelessWidget {
             t: t,
           ),
           _MenuRow(
+            icon: NoteeIcon.share,
+            label: '동기화 큐 보기',
+            onTap: () {
+              Navigator.of(context).pop();
+              showDialog<void>(
+                context: context,
+                builder: (_) => const _SyncQueueDialog(),
+              );
+            },
+            t: t,
+          ),
+          _MenuRow(
             icon: NoteeIcon.gear,
             label: 'PDF 렌더 스레드 수',
             onTap: () async {
@@ -1170,6 +1188,324 @@ class _QueueSection extends StatelessWidget {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Thin sync progress strip shown at top of library content ────────────
+class _SyncProgressStrip extends ConsumerStatefulWidget {
+  const _SyncProgressStrip();
+  @override
+  ConsumerState<_SyncProgressStrip> createState() => _SyncProgressStripState();
+}
+
+class _SyncProgressStripState extends ConsumerState<_SyncProgressStrip> {
+  StreamSubscription<void>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    // Repaint live as workers start/finish.
+    _sub = ref.read(syncActionsProvider).onChanged.listen((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    final cloud = ref.watch(cloudSyncProvider);
+    final pending = ref.watch(pendingAssetNotesProvider);
+    final snap = ref.read(syncActionsProvider).snapshot();
+    final queued = snap.p0.length + snap.p1.length + snap.p2.length;
+    final running = snap.running.length;
+
+    final isSyncing = cloud.status == CloudSyncStatus.syncing ||
+        cloud.status == CloudSyncStatus.checking ||
+        queued > 0 ||
+        running > 0 ||
+        pending.isNotEmpty;
+    if (!isSyncing) return const SizedBox.shrink();
+
+    // Determinate value during Phase A; indeterminate during asset transfer.
+    final value = (cloud.syncTotal != null &&
+            cloud.syncTotal! > 0 &&
+            cloud.syncCurrent != null &&
+            cloud.status == CloudSyncStatus.syncing)
+        ? (cloud.syncCurrent! / cloud.syncTotal!).clamp(0.0, 1.0)
+        : null;
+
+    final label = <String>[];
+    if (cloud.syncTotal != null && cloud.syncTotal! > 0) {
+      label.add('동기화 ${cloud.syncCurrent ?? 0}/${cloud.syncTotal}');
+    } else if (cloud.status == CloudSyncStatus.checking) {
+      label.add('연결 확인 중…');
+    }
+    if (running > 0) label.add('전송 ${running}개 진행 중');
+    if (queued > 0) label.add('${queued}개 대기');
+    if (pending.isNotEmpty) label.add('에셋 ${pending.length}개 남음');
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (label.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Text(
+              label.join('  ·  '),
+              style: TextStyle(
+                  fontFamily: 'JetBrainsMono',
+                  fontSize: 10,
+                  color: t.inkFaint),
+            ),
+          ),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(2),
+          child: SizedBox(
+            height: 3,
+            child: LinearProgressIndicator(
+              value: value,
+              backgroundColor: t.tbBorder,
+              valueColor: AlwaysStoppedAnimation<Color>(t.accent),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ── Sync transfer queue viewer ───────────────────────────────────────────
+class _SyncQueueDialog extends ConsumerStatefulWidget {
+  const _SyncQueueDialog();
+  @override
+  ConsumerState<_SyncQueueDialog> createState() => _SyncQueueDialogState();
+}
+
+class _SyncQueueDialogState extends ConsumerState<_SyncQueueDialog> {
+  StreamSubscription<void>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _sub = ref.read(syncActionsProvider).onChanged.listen((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    final s = ref.read(syncActionsProvider).snapshot();
+    return Dialog(
+      backgroundColor: t.toolbar,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 480, maxHeight: 560),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(children: [
+                Text('동기화 큐',
+                    style: TextStyle(
+                      fontFamily: 'Newsreader',
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: t.ink,
+                    )),
+                const Spacer(),
+                Text('워커 ${s.maxWorkers}개 · 진행 중 ${s.running.length}',
+                    style: TextStyle(
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 11,
+                        color: t.inkFaint)),
+              ]),
+              const SizedBox(height: 12),
+              Expanded(
+                child: ListView(
+                  shrinkWrap: true,
+                  children: [
+                    _SyncQueueSection(
+                        title: 'P0 · 사용자 요청',
+                        files: s.p0,
+                        accent: const Color(0xFF2563EB),
+                        t: t),
+                    _SyncQueueSection(
+                        title: 'P1 · 현재 동기화 세션',
+                        files: s.p1,
+                        accent: const Color(0xFF059669),
+                        t: t),
+                    _SyncQueueSection(
+                        title: 'P2 · 백그라운드 / 재시도',
+                        files: s.p2,
+                        accent: t.inkFaint,
+                        t: t),
+                    if (s.running.isNotEmpty)
+                      _SyncQueueSection(
+                          title: '진행 중',
+                          files: s.running,
+                          accent: const Color(0xFFEF4444),
+                          t: t),
+                  ],
+                ),
+              ),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('닫기'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SyncQueueSection extends StatelessWidget {
+  const _SyncQueueSection({
+    required this.title,
+    required this.files,
+    required this.accent,
+    required this.t,
+  });
+  final String title;
+  final List<AssetFileView> files;
+  final Color accent;
+  final NoteeTokens t;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(color: accent, shape: BoxShape.circle),
+            ),
+            const SizedBox(width: 8),
+            Text(title,
+                style: TextStyle(
+                    fontFamily: 'Inter Tight',
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: t.inkDim)),
+            const SizedBox(width: 6),
+            Text('(${files.length})',
+                style: TextStyle(
+                    fontFamily: 'JetBrainsMono',
+                    fontSize: 11,
+                    color: t.inkFaint)),
+          ]),
+          const SizedBox(height: 6),
+          if (files.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 16),
+              child: Text('—',
+                  style: TextStyle(
+                      fontFamily: 'JetBrainsMono',
+                      fontSize: 11,
+                      color: t.inkFaint)),
+            )
+          else
+            for (final f in files) _buildFileRow(f, t),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFileRow(AssetFileView f, NoteeTokens t) {
+    final pct = f.progress;
+    String sizeLabel = '';
+    if (f.bytesTotal != null && f.bytesTotal! > 0) {
+      final mb = (f.bytesTransferred ?? 0) / 1024 / 1024;
+      final totalMb = f.bytesTotal! / 1024 / 1024;
+      sizeLabel = '${mb.toStringAsFixed(1)}/${totalMb.toStringAsFixed(1)}MB';
+    }
+    final pctLabel = pct != null ? '${(pct * 100).toStringAsFixed(0)}%' : '';
+    final isRunning = f.priority == 'running';
+    return Padding(
+      padding: const EdgeInsets.only(left: 16, top: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(children: [
+            Text(
+              f.direction == 'upload' ? '↑' : '↓',
+              style: TextStyle(
+                  fontFamily: 'JetBrainsMono',
+                  fontSize: 11,
+                  color: f.direction == 'upload'
+                      ? const Color(0xFF059669)
+                      : const Color(0xFF2563EB)),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '${f.assetId.substring(0, math.min(12, f.assetId.length))}…  · note ${f.noteId.substring(0, math.min(6, f.noteId.length))}',
+                style: TextStyle(
+                    fontFamily: 'JetBrainsMono',
+                    fontSize: 11,
+                    color: t.ink),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (isRunning && pctLabel.isNotEmpty) ...[
+              const SizedBox(width: 6),
+              Text(pctLabel,
+                  style: TextStyle(
+                      fontFamily: 'JetBrainsMono',
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      color: t.accent)),
+            ],
+          ]),
+          if (isRunning) ...[
+            const SizedBox(height: 3),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(2),
+              child: SizedBox(
+                height: 3,
+                child: LinearProgressIndicator(
+                  value: pct,
+                  backgroundColor: t.tbBorder,
+                  valueColor: AlwaysStoppedAnimation<Color>(t.accent),
+                ),
+              ),
+            ),
+            if (sizeLabel.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(sizeLabel,
+                    style: TextStyle(
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 9,
+                        color: t.inkFaint)),
+              ),
+          ],
         ],
       ),
     );
@@ -1626,11 +1962,6 @@ class _MainAreaState extends ConsumerState<_MainArea> {
     _selectedFolderIds.clear();
   });
 
-  void _clearSelectedItems() => setState(() {
-    _selectedNoteIds.clear();
-    _selectedFolderIds.clear();
-  });
-
   void _setSelectionFromRubberBand(
       Set<String> noteIds, Set<String> folderIds, Offset globalPos) {
     setState(() {
@@ -1642,75 +1973,7 @@ class _MainAreaState extends ConsumerState<_MainArea> {
         ..addAll(folderIds);
       _selectionMode = _selectedNoteIds.isNotEmpty || _selectedFolderIds.isNotEmpty;
     });
-    if (_selectionMode) {
-      _showRubberBandActions(globalPos);
-    }
-  }
-
-  Future<void> _showRubberBandActions(Offset pos) async {
-    final ctl = ref.read(libraryProvider.notifier);
-    final hasFolder = _selectedFolderIds.isNotEmpty;
-    final result = await showNoteeMenuAt<_BulkAction>(
-      context,
-      position: pos,
-      items: [
-        const NoteeMenuItem(
-          label: '이동',
-          value: _BulkAction.move,
-          icon: Icon(Icons.drive_file_move_outline, size: 16),
-        ),
-        if (!hasFolder)
-          const NoteeMenuItem(
-            label: '복제',
-            value: _BulkAction.duplicate,
-            icon: Icon(Icons.copy_rounded, size: 16),
-          ),
-        const NoteeMenuItem.separator(),
-        const NoteeMenuItem(
-          label: '삭제',
-          value: _BulkAction.delete,
-          icon: Icon(Icons.delete_outline, size: 16),
-          danger: true,
-        ),
-      ],
-    );
-    if (!mounted || result == null) return;
-    switch (result) {
-      case _BulkAction.move:
-        final lib = ref.read(libraryProvider).value;
-        final excludeIds = <String>{};
-        if (lib != null) {
-          for (final id in _selectedFolderIds) {
-            excludeIds.addAll(_allDescendantFolderIds(lib.folders, id));
-          }
-        }
-        if (!mounted) return;
-        final folderId =
-            await _pickFolder(context, ref, excludeFolderIds: excludeIds);
-        if (folderId != null && mounted) {
-          final target = folderId == '__root__' ? null : folderId;
-          await ctl.bulkMoveItems(
-              _selectedNoteIds, _selectedFolderIds, target);
-          _clearSelectedItems();
-        }
-      case _BulkAction.duplicate:
-        await ctl.bulkDuplicate(_selectedNoteIds);
-        _clearSelectedItems();
-      case _BulkAction.delete:
-        final total = _selectedNoteIds.length + _selectedFolderIds.length;
-        final ok = await noteeConfirm(context,
-            title: '$total개 항목 삭제', body: '선택한 항목이 모두 삭제됩니다.');
-        if (!mounted) return;
-        if (ok) {
-          for (final id in _selectedFolderIds) {
-            await ctl.deleteFolder(id);
-          }
-          if (_selectedNoteIds.isNotEmpty) {
-            await ctl.bulkDelete(_selectedNoteIds);
-          }
-          _clearSelectedItems();
-        }
-    }
+    // No context menu — user interacts via the _MultiSelectBar that appears.
   }
 
   Future<void> _openNote(String id) async {
@@ -1796,7 +2059,10 @@ class _MainAreaState extends ConsumerState<_MainArea> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _Breadcrumb(state: state),
-          const SizedBox(height: 14),
+          const SizedBox(height: 8),
+          // Thin sync progress bar — only visible while sync is active.
+          const _SyncProgressStrip(),
+          const SizedBox(height: 6),
           // Multi-select bar replaces header when items are selected.
           if (_selectionMode)
             _MultiSelectBar(
@@ -1820,7 +2086,7 @@ class _MainAreaState extends ConsumerState<_MainArea> {
                   if (_selectedNoteIds.isNotEmpty) {
                     await ctl.bulkDelete(_selectedNoteIds);
                   }
-                  _clearSelectedItems();
+                  _exitSelectionMode();
                 }
               },
               onMove: _selectedIds.isEmpty ? null : () async {
@@ -1838,13 +2104,13 @@ class _MainAreaState extends ConsumerState<_MainArea> {
                 if (folderId != null && context.mounted) {
                   final target = folderId == '__root__' ? null : folderId;
                   await ctl.bulkMoveItems(_selectedNoteIds, _selectedFolderIds, target);
-                  _clearSelectedItems();
+                  _exitSelectionMode();
                 }
               },
               onDuplicate: (_selectedFolderIds.isEmpty && _selectedNoteIds.isNotEmpty)
                   ? () async {
                       await ctl.bulkDuplicate(_selectedNoteIds);
-                      _clearSelectedItems();
+                      _exitSelectionMode();
                     }
                   : null,
               // Single-item extras
@@ -1860,6 +2126,7 @@ class _MainAreaState extends ConsumerState<_MainArea> {
                 if (name != null && name.trim().isNotEmpty) {
                   await ctl.renameFolder(f.id, name.trim());
                 }
+                if (mounted) _exitSelectionMode();
               },
               onSingleFolderAppearance: (f) async {
                 if (!context.mounted) return;
@@ -1876,6 +2143,7 @@ class _MainAreaState extends ConsumerState<_MainArea> {
                 if (name != null && name.trim().isNotEmpty) {
                   await ctl.renameNotebook(n.id, name.trim());
                 }
+                if (mounted) _exitSelectionMode();
               },
               onSingleNoteFavorite: (n) => ctl.toggleFavorite(n.id),
               onSingleNoteExport: (n) async {
@@ -3587,7 +3855,6 @@ String _relTime(DateTime t) {
 // ── Right-click context menus ─────────────────────────────────────────
 enum _NoteCtx { rename, duplicate, move, favorite, export, delete }
 enum _FolderCtx { rename, changeAppearance, delete }
-enum _BulkAction { move, duplicate, delete }
 
 Future<void> _showNoteContextMenu(
     BuildContext context, WidgetRef ref, NoteSummary n, Offset pos) async {
@@ -4194,6 +4461,18 @@ class _CloudBadgeState extends ConsumerState<_CloudBadge>
 
 // ─── Cloud status popover ─────────────────────────────────────────────────
 
+String _buildSyncSummary(CloudSyncState cloud) {
+  final pushed = cloud.lastSyncPushedNotes ?? 0;
+  final pulled = cloud.lastSyncPulledNotes ?? 0;
+  final changes = cloud.lastSyncChanges ?? 0;
+  final parts = <String>[];
+  if (pushed > 0) parts.add('↑ $pushed개 노트 업로드');
+  if (pulled > 0) parts.add('↓ $pulled개 노트 다운로드');
+  if (changes > 0) parts.add('$changes개 변경사항');
+  if (parts.isEmpty) parts.add('변경 없음');
+  return '마지막 동기화: ${parts.join('  ')}';
+}
+
 class _CloudPopover extends ConsumerWidget {
   const _CloudPopover({required this.tokens});
   final NoteeTokens tokens;
@@ -4230,6 +4509,48 @@ class _CloudPopover extends ConsumerWidget {
             ),
           ]),
 
+          // Progress bar — visible during syncing/checking.
+          if (cloud.status == CloudSyncStatus.syncing ||
+              cloud.status == CloudSyncStatus.checking) ...[
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: SizedBox(
+                height: 4,
+                child: LinearProgressIndicator(
+                  value: (cloud.syncTotal != null &&
+                          cloud.syncTotal! > 0 &&
+                          cloud.syncCurrent != null)
+                      ? (cloud.syncCurrent! / cloud.syncTotal!).clamp(0.0, 1.0)
+                      : null, // indeterminate (Phase B / checking)
+                  backgroundColor: t.tbBorder,
+                  valueColor: AlwaysStoppedAnimation<Color>(t.accent),
+                ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            // Progress detail line — assets still pending + active workers.
+            Builder(builder: (_) {
+              final pending = ref.watch(pendingAssetNotesProvider);
+              final running = ref.read(syncActionsProvider).snapshot().running.length;
+              final phase = (cloud.syncTotal != null && cloud.syncTotal! > 0)
+                  ? '${cloud.syncCurrent ?? 0} / ${cloud.syncTotal}'
+                  : '';
+              final assets = pending.isNotEmpty
+                  ? '에셋 ${pending.length}개 대기 · 워커 $running'
+                  : '';
+              final parts = [phase, assets].where((s) => s.isNotEmpty).join('  ·  ');
+              if (parts.isEmpty) return const SizedBox.shrink();
+              return Text(
+                parts,
+                style: TextStyle(
+                    fontFamily: 'JetBrainsMono',
+                    color: t.inkFaint,
+                    fontSize: 10),
+              );
+            }),
+          ],
+
           // Server URL.
           if (cloud.serverUrl != null) ...[
             const SizedBox(height: 6),
@@ -4255,10 +4576,10 @@ class _CloudPopover extends ConsumerWidget {
           ],
 
           // Last sync stats.
-          if (cloud.lastSyncTotal != null) ...[
+          if (cloud.lastSyncPushedNotes != null || cloud.lastSyncPulledNotes != null) ...[
             const SizedBox(height: 4),
             Text(
-              '마지막 동기화: ${cloud.lastSyncTotal}개 노트, ${cloud.lastSyncPushed}개 항목 업로드',
+              _buildSyncSummary(cloud),
               style: TextStyle(color: t.inkFaint, fontSize: 11),
             ),
           ],

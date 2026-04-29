@@ -13,6 +13,7 @@ import '../../data/db/repository.dart';
 import '../../domain/folder.dart';
 import '../lock/note_lock_service.dart';
 import '../sync/sync_actions.dart';
+import '../sync/sync_state.dart';
 import '../../domain/layer.dart';
 import '../../domain/note.dart';
 import '../../domain/page.dart';
@@ -110,9 +111,16 @@ class LibraryController extends AsyncNotifier<LibraryState> {
   }
 
   /// Refresh local library state, then broadcast so other instances refresh.
+  /// Also kicks off a server sync so create/delete/rename/move/duplicate
+  /// land on the server (and other devices) immediately rather than waiting
+  /// for the 30-second background poll.
   Future<void> _refreshAndBroadcast() async {
     await refresh();
     ref.read(noteLockServiceProvider).broadcastLibraryChanged();
+    // Fire-and-forget sync. CloudSyncNotifier.syncAll guards re-entry, so
+    // calling this many times in quick succession is safe.
+    // ignore: unawaited_futures
+    ref.read(cloudSyncProvider.notifier).syncAll();
   }
 
   void navigateInto(String folderId) {

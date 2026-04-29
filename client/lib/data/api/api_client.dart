@@ -147,7 +147,12 @@ class ApiClient {
   }
 
   /// Uploads [file] for [assetId] as a streaming PUT (no full-memory copy).
-  Future<void> uploadAsset(String assetId, File file) async {
+  /// Calls [onProgress] periodically with (bytesSent, totalBytes).
+  Future<void> uploadAsset(
+    String assetId,
+    File file, {
+    void Function(int sent, int total)? onProgress,
+  }) async {
     final length = await file.length();
     await _withAuthRetry(() => _dio.put(
           '/v1/assets/$assetId',
@@ -162,32 +167,61 @@ class ApiClient {
             },
             responseType: ResponseType.bytes,
           ),
+          onSendProgress: onProgress,
         ));
   }
 
   /// Downloads [assetId] directly to [savePath] (streaming, no memory copy).
   /// Returns false if not found or on error.
-  Future<bool> downloadAssetToFile(String assetId, String savePath) async {
+  ///
+  /// Atomic-write pattern: download into "$savePath.partial" first and
+  /// rename only after the body has fully landed. If the process is killed
+  /// mid-download, the .partial sticks around (cleaned up on next launch by
+  /// AssetService.cleanupPartialDownloads) but [savePath] never contains a
+  /// corrupt half-file that would crash the PDF renderer next time.
+  Future<bool> downloadAssetToFile(
+    String assetId,
+    String savePath, {
+    void Function(int received, int total)? onProgress,
+  }) async {
+    final tempPath = '$savePath.partial';
     try {
+      // Drop any stale temp file from a prior interrupted attempt.
+      try { File(tempPath).deleteSync(); } catch (_) {}
       await _withAuthRetry(() => _dio.download(
             '/v1/assets/$assetId',
-            savePath,
+            tempPath,
             options: Options(
               receiveTimeout: const Duration(minutes: 10),
               headers: _tokens != null
                   ? {'authorization': 'Bearer ${_tokens!.accessToken}'}
                   : null,
             ),
+            onReceiveProgress: onProgress,
           ));
+      // Promote temp → final atomically on success.
+      await File(tempPath).rename(savePath);
       return true;
     } catch (_) {
       // Clean up partial file on failure.
+      try { File(tempPath).deleteSync(); } catch (_) {}
       try { File(savePath).deleteSync(); } catch (_) {}
       return false;
     }
   }
 
   // ── History ────────────────────────────────────────────────────────
+  /// Asks the server to seal all uncommitted revisions into a new commit.
+  /// No-op if there are no uncommitted revisions (returns committed:false).
+  Future<Map<String, dynamic>> commitNote(String noteId, {String? message}) async {
+    final r = await _withAuthRetry(() => _dio.post(
+          '/v1/sync/$noteId/commit',
+          data: message != null ? {'message': message} : null,
+          options: _bearerOpts(),
+        ));
+    return r.data as Map<String, dynamic>;
+  }
+
   Future<Map<String, dynamic>> historyList(String noteId) async {
     final r = await _withAuthRetry(() => _dio.get(
           '/v1/sync/$noteId/history',

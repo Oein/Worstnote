@@ -305,9 +305,16 @@ class ThumbnailService {
 
   Future<void> _drawPdfBackground(
       Canvas canvas, Size size, String assetId, int pageNo) async {
+    File? file;
     try {
-      final file = await AssetService().fileFor(assetId);
+      file = await AssetService().fileFor(assetId);
       if (file == null) return;
+      // Defensive size check: a 0-byte file is a leftover from an interrupted
+      // download — opening it would either crash pdfium or hand us garbage.
+      if (await file.length() == 0) {
+        await file.delete();
+        return;
+      }
       final doc = await PdfDocument.openFile(file.path);
       if (pageNo < 1 || pageNo > doc.pages.length) {
         await doc.dispose();
@@ -339,7 +346,12 @@ class ThumbnailService {
         uiImage.dispose();
       }
       await doc.dispose();
-    } catch (_) {}
+    } catch (_) {
+      // Corrupt PDF asset — delete so the next sync re-downloads cleanly.
+      try {
+        if (file != null && await file.exists()) await file.delete();
+      } catch (_) {}
+    }
   }
 
   Future<void> _drawImageBackground(

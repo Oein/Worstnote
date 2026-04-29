@@ -7,6 +7,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' show Size;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -17,6 +18,7 @@ import '../../data/api/api_client.dart';
 import '../../domain/page_object.dart';
 import '../../domain/page_spec.dart';
 import '../import/asset_service.dart';
+import '../import/pdf_render_cache.dart';
 import '../library/thumbnail_service.dart';
 import '../auth/auth_state.dart';
 import '../notebook/notebook_state.dart';
@@ -191,6 +193,65 @@ final pendingAssetNotesProvider =
     NotifierProvider<PendingAssetNotesNotifier, Set<String>>(
         PendingAssetNotesNotifier.new);
 
+// Priority levels — same semantics as PdfRenderCache:
+//   p0: user-requested (note being opened right now)
+//   p1: current sync session (active push or pull)
+//   p2: background / resume-from-crash
+enum _AssetPriority { p0, p1, p2 }
+
+enum _AssetDir { upload, download }
+
+class _AssetJob {
+  _AssetJob({
+    required this.assetId,
+    required this.noteId,
+    required this.dir,
+    required this.priority,
+    this.localFile,    // upload only: source file resolved at enqueue
+    this.savePath,     // download only: destination path
+  });
+  final String assetId;
+  final String noteId;
+  final _AssetDir dir;
+  _AssetPriority priority;
+  final File? localFile;
+  final String? savePath;
+}
+
+class _NoteAssetState {
+  _NoteAssetState({required this.pagesJson, required this.totalAssets});
+  final List<dynamic> pagesJson; // for _enqueuePdfRenderJobs after note completes
+  int totalAssets;
+  int completedAssets = 0;
+  bool allOk = true;
+}
+
+/// Read-only view of one asset *file* (PDF/image) being transferred or
+/// queued — granularity is per-file, not per-note. Used by the queue
+/// viewer modal so the user sees every individual file moving.
+class AssetFileView {
+  const AssetFileView({
+    required this.assetId,
+    required this.noteId,
+    required this.direction, // 'upload' | 'download'
+    required this.priority,  // 'P0' | 'P1' | 'P2' | 'running'
+    this.bytesTransferred,   // null unless this file is in flight
+    this.bytesTotal,
+  });
+  final String assetId;
+  final String noteId;
+  final String direction;
+  final String priority;
+  final int? bytesTransferred;
+  final int? bytesTotal;
+
+  /// 0.0–1.0 if total is known, else null (indeterminate).
+  double? get progress {
+    if (bytesTotal == null || bytesTotal! <= 0) return null;
+    return (bytesTransferred ?? 0) / bytesTotal!;
+  }
+}
+
 class SyncResult {
   SyncResult({
     required this.pushed,
@@ -209,46 +270,263 @@ class SyncActions {
   // Tracks last server cursor per noteId for incremental pulls.
   final Map<String, int> _pullCursors = {};
 
-  // Asset-download queue: noteId → page JSON list still to process.
-  // Populated after Phase A (DB pull) and drained in Phase B in priority order.
-  final Map<String, List<dynamic>> _assetQueue = {};
-  // When set, the queue picks this note next (used for "open during sync").
-  String? _priorityNoteId;
-  // Callers awaiting a specific note's assets to be ready.
+  // Unified asset transfer queue (uploads + downloads).
+  // Priority: p0 (user-requested) > p1 (current session) > p2 (background).
+  final List<_AssetJob> _jobQueue = [];
+  // Per-note completion tracking for downloads (file-level queue).
+  final Map<String, _NoteAssetState> _noteState = {};
+  // Callers awaiting a specific note's assets (download only).
   final Map<String, List<Completer<void>>> _waiters = {};
-
   // Process-unique session ID for cross-window ownership coordination.
   late final String _sessionId =
       '${DateTime.now().microsecondsSinceEpoch}-${math.Random().nextInt(1 << 32)}';
+  // Number of parallel transfer workers.
+  static const int _maxWorkers = 3;
+  // Per-file transfers currently in flight. Keyed by assetId so the same
+  // asset can't appear twice (workers de-dupe via _seenInFlight).
+  // Each entry = (assetId, noteId, direction).
+  final Map<String, ({String noteId, _AssetDir dir})> _activeFiles = {};
+  // Broadcast queue-state changes so the modal can repaint live.
+  final StreamController<void> _changes = StreamController<void>.broadcast();
+  Stream<void> get onChanged => _changes.stream;
+  int get maxWorkers => _maxWorkers;
 
-  /// Bumps [noteId]'s assets to the front of the queue and returns a Future
-  /// that completes once that note's assets are fully on-disk. Resolves
-  /// immediately if the note has no pending assets.
-  Future<void> prioritizeNoteAssets(String noteId) async {
-    // If pending state says the note still needs assets but our queue is
-    // empty (e.g. another window started the sync, or we just relaunched),
-    // load the note's pages from local DB and queue its assets first.
-    if (!_assetQueue.containsKey(noteId)) {
-      final pending = ref.read(pendingAssetNotesProvider);
-      if (pending.contains(noteId)) {
-        await resumeAssetDownloads();
+  // Bytes transferred so far / total bytes per active assetId. Updated by
+  // Dio's onReceiveProgress / onSendProgress callbacks; throttled so we
+  // don't fire _changes on every TCP chunk.
+  final Map<String, ({int received, int total})> _activeProgress = {};
+  // Last time we broadcast a progress tick (per asset) — keeps repaint cost
+  // sane during a fast download.
+  final Map<String, DateTime> _lastProgressBroadcast = {};
+
+  void _setActiveFile(String assetId, String noteId, _AssetDir dir) {
+    _activeFiles[assetId] = (noteId: noteId, dir: dir);
+    _activeProgress[assetId] = (received: 0, total: 0);
+    _changes.add(null);
+  }
+
+  void _clearActiveFile(String assetId) {
+    _activeFiles.remove(assetId);
+    _activeProgress.remove(assetId);
+    _lastProgressBroadcast.remove(assetId);
+    _changes.add(null);
+  }
+
+  void _updateProgress(String assetId, int received, int total) {
+    _activeProgress[assetId] = (received: received, total: total);
+    // Throttle: at most ~5 events/second per asset.
+    final now = DateTime.now();
+    final last = _lastProgressBroadcast[assetId];
+    if (last == null || now.difference(last) > const Duration(milliseconds: 200)) {
+      _lastProgressBroadcast[assetId] = now;
+      _changes.add(null);
+    }
+  }
+
+  void _enqueueJob(_AssetJob job) {
+    final idx = _jobQueue.indexWhere(
+        (j) => j.assetId == job.assetId && j.dir == job.dir);
+    if (idx >= 0) {
+      // Already queued — bump to higher priority if needed.
+      if (job.priority.index < _jobQueue[idx].priority.index) {
+        _jobQueue[idx].priority = job.priority;
+        _changes.add(null);
+      }
+      return;
+    }
+    _jobQueue.add(job);
+    _changes.add(null);
+  }
+
+  /// Expand a note's pull-data into per-file download jobs.
+  /// Files already on disk are skipped. Returns false if no work was queued
+  /// (e.g. all assets already present), in which case caller should fire
+  /// onReady immediately.
+  Future<bool> _enqueueDownloadFiles({
+    required String noteId,
+    required List<dynamic> pagesJson,
+    required _AssetPriority priority,
+  }) async {
+    final assetService = AssetService();
+    final assetIds = <String>{};
+    for (final p in pagesJson) {
+      try {
+        final pm = p as Map<String, dynamic>;
+        final specMap = _resolveSpec(pm['spec']);
+        if (specMap == null) continue;
+        final spec = PageSpec.fromJson(specMap);
+        final bg = spec.background;
+        String? id;
+        if (bg is PdfBackground) id = bg.assetId;
+        if (bg is ImageBackground) id = bg.assetId;
+        if (id != null && id.isNotEmpty) assetIds.add(id);
+      } catch (_) {}
+    }
+    // Skip files already on disk.
+    final pending = <String>[];
+    for (final id in assetIds) {
+      if (await assetService.fileFor(id) == null) pending.add(id);
+    }
+    if (pending.isEmpty) return false;
+    _noteState[noteId] = _NoteAssetState(
+      pagesJson: pagesJson,
+      totalAssets: pending.length,
+    );
+    for (final id in pending) {
+      final savePath = await assetService.assetPath(id);
+      _enqueueJob(_AssetJob(
+        assetId: id,
+        noteId: noteId,
+        dir: _AssetDir.download,
+        priority: priority,
+        savePath: savePath,
+      ));
+    }
+    return true;
+  }
+
+  Future<void> _enqueueUploadFiles({
+    required String noteId,
+    required List<PageSpec> specs,
+    required _AssetPriority priority,
+  }) async {
+    final assetService = AssetService();
+    final seen = <String>{};
+    for (final spec in specs) {
+      final bg = spec.background;
+      String? id;
+      if (bg is PdfBackground) id = bg.assetId;
+      if (bg is ImageBackground) id = bg.assetId;
+      if (id == null || id.isEmpty || !seen.add(id)) continue;
+      final file = await assetService.fileFor(id);
+      if (file == null) continue;
+      _enqueueJob(_AssetJob(
+        assetId: id,
+        noteId: noteId,
+        dir: _AssetDir.upload,
+        priority: priority,
+        localFile: file,
+      ));
+    }
+  }
+
+  /// Read-only snapshot of every file (PDF/image) the sync system is
+  /// either transferring or has queued — flat list, not grouped by note.
+  /// Files currently in flight don't appear in the priority sections;
+  /// they live in [running] instead.
+  ({
+    List<AssetFileView> p0,
+    List<AssetFileView> p1,
+    List<AssetFileView> p2,
+    List<AssetFileView> running,
+    int maxWorkers,
+  }) snapshot() {
+    AssetFileView toView(_AssetJob j) => AssetFileView(
+          assetId: j.assetId,
+          noteId: j.noteId,
+          direction: j.dir == _AssetDir.upload ? 'upload' : 'download',
+          priority: j.priority == _AssetPriority.p0
+              ? 'P0'
+              : j.priority == _AssetPriority.p1
+                  ? 'P1'
+                  : 'P2',
+        );
+    final p0 = <AssetFileView>[];
+    final p1 = <AssetFileView>[];
+    final p2 = <AssetFileView>[];
+    for (final j in _jobQueue) {
+      final view = toView(j);
+      switch (j.priority) {
+        case _AssetPriority.p0: p0.add(view);
+        case _AssetPriority.p1: p1.add(view);
+        case _AssetPriority.p2: p2.add(view);
       }
     }
-    if (!_assetQueue.containsKey(noteId)) return;
-    _priorityNoteId = noteId;
+    final running = <AssetFileView>[];
+    _activeFiles.forEach((assetId, meta) {
+      final prog = _activeProgress[assetId];
+      running.add(AssetFileView(
+        assetId: assetId,
+        noteId: meta.noteId,
+        direction: meta.dir == _AssetDir.upload ? 'upload' : 'download',
+        priority: 'running',
+        bytesTransferred: prog?.received,
+        bytesTotal: prog?.total,
+      ));
+    });
+    return (p0: p0, p1: p1, p2: p2, running: running, maxWorkers: _maxWorkers);
+  }
+
+  _AssetJob? _pickNext() {
+    if (_jobQueue.isEmpty) return null;
+    final indices = List<int>.generate(_jobQueue.length, (i) => i);
+    indices.sort((a, b) =>
+        _jobQueue[a].priority.index.compareTo(_jobQueue[b].priority.index));
+    for (final idx in indices) {
+      if (!_activeFiles.containsKey(_jobQueue[idx].assetId)) {
+        return _jobQueue.removeAt(idx);
+      }
+    }
+    return null;
+  }
+
+  /// Bumps [noteId]'s download job to P0 and waits until its assets are
+  /// fully on disk. Resolves immediately if the note has no pending assets.
+  Future<void> prioritizeNoteAssets(String noteId) async {
+    // Three states the note can be in:
+    //   inQueue:  files for it are sitting in _jobQueue
+    //   inFlight: a worker is mid-download (note in _noteState, files removed
+    //             from _jobQueue by _pickNext)
+    //   neither:  no work registered → try to enqueue from pending
+    bool inQueue = _jobQueue.any(
+        (j) => j.noteId == noteId && j.dir == _AssetDir.download);
+    bool inFlight = _noteState.containsKey(noteId);
+
+    if (!inQueue && !inFlight) {
+      final pending = ref.read(pendingAssetNotesProvider);
+      if (!pending.contains(noteId)) return; // genuinely nothing to wait for
+      await resumeAssetDownloads();
+      inQueue = _jobQueue.any(
+          (j) => j.noteId == noteId && j.dir == _AssetDir.download);
+      inFlight = _noteState.containsKey(noteId);
+    }
+
+    // After resume: if still nothing, every asset is on disk (resumeAssetDownloads
+    // cleared pending) — the editor can open immediately.
+    if (!inQueue && !inFlight) return;
+
+    // Bump any *queued* jobs for this note to P0. Already-running jobs can't
+    // be re-prioritised but they'll finish on their own.
+    for (final j in _jobQueue) {
+      if (j.noteId == noteId && j.dir == _AssetDir.download) {
+        j.priority = _AssetPriority.p0;
+      }
+    }
+    _changes.add(null);
+
+    // Make sure a drain is actually running. If workers all exited
+    // before this note was queued (idle pool, queue went empty briefly),
+    // _draining is false and the freshly-enqueued P0 job would just sit.
+    if (_jobQueue.isNotEmpty && !_draining) {
+      final auth = ref.read(authProvider).value;
+      if (auth != null && auth.isLoggedIn) {
+        final api = apiFor(auth);
+        final notifier = ref.read(pendingAssetNotesProvider.notifier);
+        // ignore: unawaited_futures
+        _drainJobQueue(api: api, notifier: notifier);
+      }
+    }
+
     final c = Completer<void>();
     _waiters.putIfAbsent(noteId, () => []).add(c);
-    debugPrint('[Sync] prioritize $noteId (queue=${_assetQueue.keys.toList()})');
+    debugPrint('[Sync] prioritize $noteId → P0 (inQueue=$inQueue inFlight=$inFlight)');
     return c.future;
   }
 
-  // Whether a phase-B drain is currently running. Prevents double-driving
-  // the queue when multiple resume calls land in quick succession.
   bool _draining = false;
 
-  /// On startup, re-enqueue assets for any notes the on-disk pending file
-  /// still lists. Loads each note's pages from local DB and queues their
-  /// PDF/image assets for download. Safe to call multiple times.
+  /// Re-enqueues assets for any notes the on-disk pending file still lists.
+  /// Queued as P2 (background). Safe to call multiple times.
   Future<void> resumeAssetDownloads() async {
     final pending = ref.read(pendingAssetNotesProvider);
     if (pending.isEmpty) return;
@@ -259,87 +537,202 @@ class SyncActions {
     final notifier = ref.read(pendingAssetNotesProvider.notifier);
 
     for (final noteId in pending) {
-      // Already in queue from this session — skip.
-      if (_assetQueue.containsKey(noteId)) continue;
+      if (_jobQueue.any(
+          (j) => j.noteId == noteId && j.dir == _AssetDir.download)) continue;
+      if (_noteState.containsKey(noteId)) continue;
       final state = await repo.loadByNoteId(noteId);
       if (state == null) {
-        // Note no longer exists locally — drop from pending.
-        notifier.remove(noteId);
+        await notifier.remove(noteId);
         continue;
       }
       final pagesJson = <Map<String, dynamic>>[
-        for (final page in state.pages)
-          {'spec': page.spec.toJson()},
+        for (final page in state.pages) {'spec': page.spec.toJson()},
       ];
-      _assetQueue[noteId] = pagesJson;
-      debugPrint('[Sync] resuming asset download for $noteId');
+      final hasWork = await _enqueueDownloadFiles(
+        noteId: noteId,
+        pagesJson: pagesJson,
+        priority: _AssetPriority.p2,
+      );
+      if (!hasWork) {
+        // Every asset already on disk — note is complete. Clean up the
+        // stale pending entry so the syncing overlay disappears and a
+        // user-tap doesn't hang waiting for nothing.
+        debugPrint('[Sync] $noteId: all assets already on disk, clearing pending');
+        await notifier.remove(noteId);
+        // Render queue may not have been seeded for this note — do it now.
+        try { await _enqueuePdfRenderJobs(pagesJson); } catch (_) {}
+        _completeWaiters(noteId);
+      } else {
+        debugPrint('[Sync] resume download $noteId (P2)');
+      }
     }
-    if (_assetQueue.isNotEmpty && !_draining) {
-      // Drive the queue without progress callbacks (silent background drain).
-      _drainAssetQueue(api: api, notifier: notifier);
+    if (_jobQueue.isNotEmpty && !_draining) {
+      // ignore: unawaited_futures
+      _drainJobQueue(api: api, notifier: notifier);
     }
   }
 
-  Future<void> _drainAssetQueue({
+  /// Drains the job queue with up to [_maxWorkers] parallel workers.
+  /// Workers pick the highest-priority job each iteration.
+  Future<void> _drainJobQueue({
     required ApiClient api,
     required PendingAssetNotesNotifier notifier,
-    void Function(String noteId)? onNoteAssetsReady,
-    void Function(int current, int total)? onProgress,
-    void Function(String? noteId)? onNoteId,
-    int currentBase = 0,
-    int total = 0,
+    void Function(String noteId)? onDownloadReady,
   }) async {
     if (_draining) return;
 
-    // Claim ownership for cross-window coordination. If another live owner
-    // exists, defer to it.
+    // Cross-window ownership: defer if another live window owns the drain.
     final cur = await _PendingAssetsStore.instance.read();
     if (cur.hasLiveOwner && cur.ownerId != _sessionId) {
-      debugPrint('[Sync] another window ($cur.ownerId) owns the drain — skipping');
+      debugPrint('[Sync] another window owns drain — skipping');
       return;
     }
     await _PendingAssetsStore.instance.setOwner(_sessionId);
 
     _draining = true;
-    Timer? heartbeat = Timer.periodic(const Duration(seconds: 3), (_) {
+    final heartbeat = Timer.periodic(const Duration(seconds: 3), (_) {
       _PendingAssetsStore.instance.heartbeat(_sessionId);
     });
 
-    int current = currentBase;
     try {
-      while (_assetQueue.isNotEmpty) {
-        final pickId = (_priorityNoteId != null &&
-                _assetQueue.containsKey(_priorityNoteId))
-            ? _priorityNoteId!
-            : _assetQueue.keys.first;
-        final pages = _assetQueue.remove(pickId)!;
-        if (_priorityNoteId == pickId) _priorityNoteId = null;
-        current++;
-        onNoteId?.call(pickId);
-        if (total > 0) onProgress?.call(current, total);
-        debugPrint('[Sync] downloading assets for $pickId');
-        try {
-          await _downloadAssets(api, pages);
-        } catch (e) {
-          debugPrint('[Sync] asset phase error for $pickId: $e');
-        }
-        try {
-          await ThumbnailService.instance.invalidate(pickId);
-        } catch (_) {}
-        await notifier.remove(pickId);
-        _completeWaiters(pickId);
-        onNoteAssetsReady?.call(pickId);
+      // Always spawn _maxWorkers workers — each loops until queue exhausted.
+      final n = _maxWorkers;
+      if (n > 0) {
+        await Future.wait(
+          List.generate(
+            n,
+            (_) => _runWorker(
+                api: api, notifier: notifier, onDownloadReady: onDownloadReady),
+            growable: false,
+          ),
+        );
       }
     } finally {
       heartbeat.cancel();
-      heartbeat = null;
       _draining = false;
-      // Release ownership only if we still hold it.
       final after = await _PendingAssetsStore.instance.read();
       if (after.ownerId == _sessionId) {
         await _PendingAssetsStore.instance.setOwner(null);
       }
     }
+  }
+
+  // One parallel worker: loops picking highest-priority jobs until queue empty.
+  Future<void> _runWorker({
+    required ApiClient api,
+    required PendingAssetNotesNotifier notifier,
+    void Function(String noteId)? onDownloadReady,
+  }) async {
+    while (true) {
+      final job = _pickNext();
+      if (job == null) {
+        if (_jobQueue.isEmpty) break;
+        // All remaining jobs are duplicates of an in-flight one — wait.
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+        continue;
+      }
+      if (job.dir == _AssetDir.upload) {
+        await _runUploadFile(api, job);
+      } else {
+        await _runDownloadFile(api, notifier, job, onDownloadReady);
+      }
+    }
+  }
+
+  Future<void> _runUploadFile(ApiClient api, _AssetJob job) async {
+    if (job.localFile == null) return;
+    _setActiveFile(job.assetId, job.noteId, _AssetDir.upload);
+    try {
+      if (await api.assetExists(job.assetId)) return;
+      final sizeMb = (await job.localFile!.length()) / 1024 / 1024;
+      debugPrint('[Sync] uploading ${job.assetId} (${sizeMb.toStringAsFixed(1)} MB)');
+      await api.uploadAsset(
+        job.assetId,
+        job.localFile!,
+        onProgress: (sent, total) => _updateProgress(job.assetId, sent, total),
+      );
+      debugPrint('[Sync] uploaded ${job.assetId} ok');
+    } catch (e) {
+      debugPrint('[Sync] upload error ${job.assetId}: $e');
+    } finally {
+      _clearActiveFile(job.assetId);
+    }
+  }
+
+  Future<void> _runDownloadFile(
+    ApiClient api,
+    PendingAssetNotesNotifier notifier,
+    _AssetJob job,
+    void Function(String noteId)? onReady,
+  ) async {
+    if (job.savePath == null) return;
+    // Another worker may have completed this file already.
+    final assetService = AssetService();
+    if (await assetService.fileFor(job.assetId) != null) {
+      _onFileDone(job.noteId, true, notifier, onReady);
+      return;
+    }
+    _setActiveFile(job.assetId, job.noteId, _AssetDir.download);
+    bool ok = false;
+    try {
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        debugPrint('[Sync] downloading ${job.assetId} (attempt $attempt/3)');
+        ok = await api.downloadAssetToFile(
+          job.assetId,
+          job.savePath!,
+          onProgress: (received, total) =>
+              _updateProgress(job.assetId, received, total),
+        );
+        if (ok) {
+          debugPrint('[Sync] downloaded ${job.assetId} ok');
+          break;
+        }
+        if (attempt < 3) {
+          final delay = Duration(seconds: 2 << (attempt - 1));
+          debugPrint('[Sync] ${job.assetId} failed, retry in ${delay.inSeconds}s');
+          await Future<void>.delayed(delay);
+        }
+      }
+      if (!ok) debugPrint('[Sync] ${job.assetId} failed after 3 attempts');
+    } finally {
+      _clearActiveFile(job.assetId);
+    }
+    _onFileDone(job.noteId, ok, notifier, onReady);
+  }
+
+  void _onFileDone(
+    String noteId,
+    bool ok,
+    PendingAssetNotesNotifier notifier,
+    void Function(String noteId)? onReady,
+  ) {
+    final info = _noteState[noteId];
+    if (info == null) return;
+    info.completedAssets++;
+    if (!ok) info.allOk = false;
+    if (info.completedAssets < info.totalAssets) return;
+    // All files done — finalize the note.
+    final pagesJson = info.pagesJson;
+    final allOk = info.allOk;
+    _noteState.remove(noteId);
+    // Schedule PDF render jobs and thumbnail invalidation as a fire-and-forget
+    // micro-task so we don't block the worker.
+    Future<void>(() async {
+      try { await _enqueuePdfRenderJobs(pagesJson); } catch (_) {}
+      try { await ThumbnailService.instance.invalidate(noteId); } catch (_) {}
+      // Always release any waiters — even if some files failed, we don't
+      // want the user's "open note" call to hang forever. The editor will
+      // open with whatever's on disk; missing files render blank but don't
+      // crash thanks to the 0-byte / corrupt-file guards.
+      _completeWaiters(noteId);
+      if (allOk) {
+        await notifier.remove(noteId);
+        onReady?.call(noteId);
+        debugPrint('[Sync] note $noteId fully done');
+      } else {
+        debugPrint('[Sync] note $noteId partial — kept in pending for next sync');
+      }
+    });
   }
 
   void _completeWaiters(String noteId) {
@@ -432,6 +825,22 @@ class SyncActions {
   }
 
   /// Silently push a single note by id. Does nothing if not logged in.
+  /// Asks the server to seal pending revisions into a new commit. No-op
+  /// server-side if nothing was pushed since the last commit.
+  Future<void> commitNote(String noteId, {String? message}) async {
+    final auth = ref.read(authProvider).value;
+    if (auth == null || !auth.isLoggedIn) return;
+    final api = apiFor(auth);
+    try {
+      final r = await api.commitNote(noteId, message: message);
+      if (r['committed'] == true) {
+        debugPrint('[Sync] committed $noteId rev_to=${r['revTo']} changes=${r['changes']}');
+      }
+    } catch (e) {
+      debugPrint('[Sync] commit error $noteId: $e');
+    }
+  }
+
   Future<void> pushNote(String noteId) async {
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return;
@@ -441,6 +850,17 @@ class SyncActions {
     if (state == null) return;
     try {
       await _push(api, state);
+      await _enqueueUploadFiles(
+        noteId: state.note.id,
+        specs: state.pages.map((p) => p.spec).toList(),
+        priority: _AssetPriority.p1,
+      );
+      // Drain immediately if not already running.
+      if (_jobQueue.isNotEmpty && !_draining) {
+        final notifier = ref.read(pendingAssetNotesProvider.notifier);
+        // ignore: unawaited_futures
+        _drainJobQueue(api: api, notifier: notifier);
+      }
     } catch (e) {
       debugPrint('[Sync] background push error for $noteId: $e');
     }
@@ -512,69 +932,59 @@ class SyncActions {
     };
     await api.syncPush(s.note.id, body);
 
-    // Upload any PDF/image assets referenced by this note's pages.
-    await _uploadAssets(api, s.pages.map((p) => p.spec).toList());
-
     return (pushed: changes.length);
   }
 
-  Future<void> _uploadAssets(ApiClient api, List<PageSpec> specs) async {
-    final assetService = AssetService();
-    // Deduplicate: many pages may share the same PDF/image asset.
-    final seen = <String>{};
-    for (final spec in specs) {
-      final bg = spec.background;
-      String? assetId;
-      if (bg is PdfBackground) assetId = bg.assetId;
-      if (bg is ImageBackground) assetId = bg.assetId;
-      if (assetId == null || assetId.isEmpty || !seen.add(assetId)) continue;
+  /// Resolves a raw specJson (Map or JSON string) to a typed Map.
+  Map<String, dynamic>? _resolveSpec(dynamic specJson) {
+    if (specJson is Map) return Map<String, dynamic>.from(specJson);
+    if (specJson is String && specJson.isNotEmpty) {
       try {
-        if (await api.assetExists(assetId)) continue;
-        final file = await assetService.fileFor(assetId);
-        if (file == null) {
-          debugPrint('[Sync] asset $assetId not found locally, skipping');
-          continue;
-        }
-        final sizeMb = (await file.length()) / 1024 / 1024;
-        debugPrint('[Sync] uploading asset $assetId (${sizeMb.toStringAsFixed(1)} MB)');
-        await api.uploadAsset(assetId, file);
-        debugPrint('[Sync] uploaded asset $assetId ok');
-      } catch (e) {
-        debugPrint('[Sync] asset upload error $assetId: $e');
-      }
+        return jsonDecode(specJson) as Map<String, dynamic>;
+      } catch (_) {}
     }
+    return null;
   }
 
-  Future<void> _downloadAssets(ApiClient api, List<dynamic> pagesJson) async {
+  /// After a note's PDF assets are on disk, queue render jobs for every
+  /// page of that note. Workers will pick them up at P2 priority (or P1/P0
+  /// once the user opens the note and the visibility hints kick in).
+  Future<void> _enqueuePdfRenderJobs(List<dynamic> pagesJson) async {
     final assetService = AssetService();
-    final seen = <String>{};
+    // Cache the resolved File per assetId so we don't fileFor() per page.
+    final fileByAsset = <String, File?>{};
+    int enqueued = 0;
     for (final p in pagesJson) {
-      final pm = p as Map<String, dynamic>;
-      final specJson = pm['spec'];
-      if (specJson == null) continue;
       try {
-        final spec = PageSpec.fromJson(
-          (specJson is Map) ? Map<String, dynamic>.from(specJson) : <String, dynamic>{},
-        );
+        final pm = p as Map<String, dynamic>;
+        final specMap = _resolveSpec(pm['spec']);
+        if (specMap == null) continue;
+        final spec = PageSpec.fromJson(specMap);
         final bg = spec.background;
-        String? assetId;
-        if (bg is PdfBackground) assetId = bg.assetId;
-        if (bg is ImageBackground) assetId = bg.assetId;
-        if (assetId == null || assetId.isEmpty || !seen.add(assetId)) continue;
-        final existing = await assetService.fileFor(assetId);
-        if (existing != null) continue;
-        final savePath = await assetService.assetPath(assetId);
-        debugPrint('[Sync] downloading asset $assetId');
-        final ok = await api.downloadAssetToFile(assetId, savePath);
-        if (!ok) {
-          debugPrint('[Sync] asset download failed $assetId');
-          continue;
+        if (bg is! PdfBackground) continue;
+        final assetId = bg.assetId;
+        if (assetId.isEmpty) continue;
+        File? file;
+        if (fileByAsset.containsKey(assetId)) {
+          file = fileByAsset[assetId];
+        } else {
+          file = await assetService.fileFor(assetId);
+          fileByAsset[assetId] = file;
         }
-        debugPrint('[Sync] downloaded asset $assetId ok');
+        if (file == null) continue;
+        PdfRenderCache.instance.enqueue(
+          file,
+          assetId,
+          bg.pageNo,
+          Size(spec.widthPt, spec.heightPt),
+          [200],
+        );
+        enqueued++;
       } catch (e) {
-        debugPrint('[Sync] asset download error: $e');
+        debugPrint('[Sync] PDF queue enqueue error: $e');
       }
     }
+    debugPrint('[Sync] _enqueuePdfRenderJobs: enqueued $enqueued jobs from ${pagesJson.length} pages');
   }
 
   Map<String, dynamic> _obj(
@@ -612,14 +1022,14 @@ class SyncActions {
 
   // Pushes every local note to the server, then pulls any server notes missing
   // locally. [onProgress] is called after each note with (current, total).
-  Future<({int pushed, int notes})> syncAllNotes({
+  Future<({int pushed, int notes, int pulled})> syncAllNotes({
     void Function(int current, int total)? onProgress,
     void Function(String? noteId)? onNoteId,
     void Function()? onNotePulled,
     void Function(String noteId)? onNoteAssetsReady,
   }) async {
     final auth = ref.read(authProvider).value;
-    if (auth == null || !auth.isLoggedIn) return (pushed: 0, notes: 0);
+    if (auth == null || !auth.isLoggedIn) return (pushed: 0, notes: 0, pulled: 0);
     final api = apiFor(auth);
     final repo = ref.read(repositoryProvider);
     final pending = ref.read(pendingAssetNotesProvider.notifier);
@@ -630,6 +1040,10 @@ class SyncActions {
 
     final summaries = await repo.listNoteSummaries();
     final localIds = summaries.map((s) => s.id).toSet();
+
+    // Load tombstones so we don't re-pull notes the user deleted locally
+    // (in case the server DELETE hasn't propagated yet).
+    final tombstones = await _loadTombstones();
 
     debugPrint('[Sync] local notes: ${summaries.length}');
 
@@ -644,6 +1058,7 @@ class SyncActions {
     final serverOnlyIds = serverNotes
         .map((s) => s['id'] as String)
         .where((id) => !localIds.contains(id))
+        .where((id) => !tombstones.contains(id)) // don't re-pull locally-deleted notes
         .toList();
     debugPrint('[Sync] server-only ids to pull: ${serverOnlyIds.length} → $serverOnlyIds');
 
@@ -652,6 +1067,7 @@ class SyncActions {
     int current = 0;
     int pushed = 0;
     int notes = 0;
+    int pulled = 0; // notes pulled from server
 
     // ── Push local notes ──────────────────────────────────────────────
     for (final s in summaries) {
@@ -664,6 +1080,12 @@ class SyncActions {
         final r = await _push(api, state);
         pushed += r.pushed;
         notes++;
+        // Enqueue asset uploads as P1 (processed in parallel with downloads).
+        await _enqueueUploadFiles(
+          noteId: state.note.id,
+          specs: state.pages.map((p) => p.spec).toList(),
+          priority: _AssetPriority.p1,
+        );
       } catch (_) {}
     }
 
@@ -682,27 +1104,35 @@ class SyncActions {
             ownerId: auth.tokens?.userId ?? '');
         debugPrint('[Sync] applyServerPull ok for $id');
         notes++;
+        pulled++;
         final pages = pullData['pages'] as List? ?? const [];
-        _assetQueue[id] = pages;
-        pending.add(id);
+        final hasWork = await _enqueueDownloadFiles(
+          noteId: id,
+          pagesJson: pages,
+          priority: _AssetPriority.p1,
+        );
+        if (hasWork) {
+          // ignore: unawaited_futures
+          pending.add(id);
+        } else {
+          // No assets to fetch — note is immediately ready.
+          try { await _enqueuePdfRenderJobs(pages); } catch (_) {}
+          onNoteAssetsReady?.call(id);
+        }
         onNotePulled?.call();
       } catch (e, st) {
         debugPrint('[Sync] pull/apply error for $id: $e\n$st');
       }
     }
 
-    // ── Phase B: download assets, priority-aware ──────────────────────
-    await _drainAssetQueue(
+    // ── Phase B: drain all queued upload+download jobs in parallel ────────
+    await _drainJobQueue(
       api: api,
       notifier: pending,
-      onNoteAssetsReady: onNoteAssetsReady,
-      onProgress: onProgress,
-      onNoteId: onNoteId,
-      currentBase: current,
-      total: total,
+      onDownloadReady: onNoteAssetsReady,
     );
 
-    return (pushed: pushed, notes: notes);
+    return (pushed: pushed, notes: notes, pulled: pulled);
   }
 }
 

@@ -23,8 +23,9 @@ class CloudSyncState {
     this.errorMessage,
     this.lastCheckedAt,
     this.serverUrl,
-    this.lastSyncPushed,
-    this.lastSyncTotal,
+    this.lastSyncPushedNotes,
+    this.lastSyncPulledNotes,
+    this.lastSyncChanges,
     this.syncCurrent,
     this.syncTotal,
     this.syncingNoteId,
@@ -34,19 +35,21 @@ class CloudSyncState {
   final String? errorMessage;
   final DateTime? lastCheckedAt;
   final String? serverUrl;
-  final int? lastSyncPushed;  // objects pushed in last sync
-  final int? lastSyncTotal;   // total notes processed in last sync
-  final int? syncCurrent;     // notes done so far in active sync
-  final int? syncTotal;       // total notes in active sync
-  final String? syncingNoteId; // note ID currently being pushed/pulled
+  final int? lastSyncPushedNotes;   // notes pushed in last sync
+  final int? lastSyncPulledNotes;   // notes pulled from server in last sync
+  final int? lastSyncChanges;       // change objects (strokes/etc.) pushed
+  final int? syncCurrent;           // notes done so far in active sync
+  final int? syncTotal;             // total notes in active sync
+  final String? syncingNoteId;      // note ID currently being pushed/pulled
 
   CloudSyncState copyWith({
     CloudSyncStatus? status,
     String? errorMessage,
     DateTime? lastCheckedAt,
     String? serverUrl,
-    int? lastSyncPushed,
-    int? lastSyncTotal,
+    int? lastSyncPushedNotes,
+    int? lastSyncPulledNotes,
+    int? lastSyncChanges,
     int? syncCurrent,
     int? syncTotal,
     String? syncingNoteId,
@@ -55,8 +58,9 @@ class CloudSyncState {
     errorMessage: errorMessage,
     lastCheckedAt: lastCheckedAt ?? this.lastCheckedAt,
     serverUrl: serverUrl ?? this.serverUrl,
-    lastSyncPushed: lastSyncPushed ?? this.lastSyncPushed,
-    lastSyncTotal: lastSyncTotal ?? this.lastSyncTotal,
+    lastSyncPushedNotes: lastSyncPushedNotes ?? this.lastSyncPushedNotes,
+    lastSyncPulledNotes: lastSyncPulledNotes ?? this.lastSyncPulledNotes,
+    lastSyncChanges: lastSyncChanges ?? this.lastSyncChanges,
     syncCurrent: syncCurrent ?? this.syncCurrent,
     syncTotal: syncTotal ?? this.syncTotal,
     syncingNoteId: syncingNoteId,
@@ -111,6 +115,11 @@ class CloudSyncNotifier extends Notifier<CloudSyncState> {
 
   Future<void> syncAll() async {
     if (state.status == CloudSyncStatus.notLoggedIn) return;
+    // Guard re-entry — callers fire syncAll after every library mutation,
+    // so multiple invocations land while a previous run is still in-flight.
+    if (state.status == CloudSyncStatus.syncing ||
+        state.status == CloudSyncStatus.checking ||
+        state.status == CloudSyncStatus.ok) return;
     state = state.copyWith(
       status: CloudSyncStatus.syncing,
       syncCurrent: 0,
@@ -137,8 +146,9 @@ class CloudSyncNotifier extends Notifier<CloudSyncState> {
       state = state.copyWith(
         status: CloudSyncStatus.ok,
         lastCheckedAt: DateTime.now(),
-        lastSyncPushed: r.pushed,
-        lastSyncTotal: r.notes,
+        lastSyncPushedNotes: r.notes - r.pulled,
+        lastSyncPulledNotes: r.pulled,
+        lastSyncChanges: r.pushed,
         syncCurrent: null,
         syncTotal: null,
         syncingNoteId: null,

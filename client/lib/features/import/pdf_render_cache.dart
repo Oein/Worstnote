@@ -217,7 +217,10 @@ class PdfRenderCache {
   Future<void> _renderOne(_RenderJob job) async {
     final dir = await _cacheDir();
     final outFile = File(p.join(dir.path, _fileName(job.assetId, job.pageNo, job.scalePct)));
-    if (await outFile.exists()) return;
+    // Skip only if the cached file exists AND has non-zero content.
+    // A 0-byte file means a previous render attempt failed mid-write; we must
+    // re-render rather than leaving a corrupt placeholder.
+    if (await outFile.exists() && await outFile.length() > 0) return;
 
     PdfDocument? doc;
     try {
@@ -259,7 +262,20 @@ class PdfRenderCache {
         scalePct: job.scalePct,
       ));
     } catch (_) {
-      // Skip on error; next job continues.
+      // Clean up any partially-written render output so the next enqueue
+      // can retry.
+      try {
+        if (await outFile.exists()) await outFile.delete();
+      } catch (_) {}
+      // The PDF source file itself might be corrupt (interrupted download
+      // from a previous session). Delete it so the next sync re-downloads
+      // a clean copy — leaving a corrupt file on disk would crash every
+      // subsequent render attempt.
+      try {
+        if (await job.pdfFile.exists() && await job.pdfFile.length() == 0) {
+          await job.pdfFile.delete();
+        }
+      } catch (_) {}
     } finally {
       await doc?.dispose();
     }

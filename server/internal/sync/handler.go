@@ -404,6 +404,18 @@ func (s *Service) Push(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "object_upsert", err.Error())
 			return
 		}
+		// Append-only revision log (git-style "blob"). commit_id stays NULL
+		// until a /commit call sweeps these into a labeled commit.
+		if _, err := tx.Exec(r.Context(),
+			`INSERT INTO page_object_revisions(object_id, note_id, page_id, layer_id,
+				kind, data, bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
+				rev, deleted, device_id)
+			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			ch.ID, noteID, ch.PageID, ch.LayerID, ch.Kind, []byte(ch.Data),
+			bboxMinX, bboxMinY, bboxMaxX, bboxMaxY, newRev, ch.Deleted, c.DeviceID); err != nil {
+			writeErr(w, http.StatusInternalServerError, "revision_insert", err.Error())
+			return
+		}
 		resp.Accepted = append(resp.Accepted, acceptedObject{ID: ch.ID, ServerRev: newRev})
 		if newRev > resp.ServerRev {
 			resp.ServerRev = newRev
@@ -432,25 +444,11 @@ func (s *Service) Push(w http.ResponseWriter, r *http.Request) {
 		resp.ConflictSessionID = sid
 	}
 
-	// Create a commit record for accepted changes.
-	if len(resp.Accepted) > 0 {
-		// Find the latest commit ID for this note (parent link).
-		var parentID *string
-		var pid string
-		if err := s.DB.QueryRow(r.Context(),
-			`SELECT id FROM note_commits WHERE note_id=$1 ORDER BY created_at DESC LIMIT 1`,
-			noteID).Scan(&pid); err == nil {
-			parentID = &pid
-		}
-		if _, err := tx.Exec(r.Context(),
-			`INSERT INTO note_commits(note_id, parent_id, user_id, device_id, message, rev_to)
-			 VALUES($1,$2,$3,$4,$5,$6)`,
-			noteID, parentID, c.UserID, c.DeviceID,
-			autoMessage(req.Changes), resp.ServerRev); err != nil {
-			writeErr(w, http.StatusInternalServerError, "commit_create", err.Error())
-			return
-		}
-	}
+	// NOTE: We no longer create a note_commit on every push. Revisions stay
+	// "uncommitted" (commit_id IS NULL) until the client calls POST
+	// /v1/sync/{noteId}/commit — fired every 3 minutes during editing and
+	// once on editor exit. This produces sparse, meaningful history rows
+	// instead of one commit per autosave.
 
 	// Update sync cursor for this device.
 	if c.DeviceID != "" {
@@ -573,6 +571,100 @@ func (s *Service) Pull(w http.ResponseWriter, r *http.Request) {
 
 // ───── History ────────────────────────────────────────────────────────────
 
+// Commit groups every page_object_revisions row that has commit_id IS NULL
+// for this note into a new note_commits entry. Idempotent: returns 200 with
+// {"committed": false} if there are no uncommitted revisions.
+//
+// Called by the client every 3 minutes during editing and once on editor
+// exit, so the history log gets coarse-grained meaningful entries instead
+// of one row per autosave.
+func (s *Service) Commit(w http.ResponseWriter, r *http.Request) {
+	c, _ := auth.ClaimsFromContext(r.Context())
+	noteID := chi.URLParam(r, "noteId")
+
+	if !ownsNote(r.Context(), s.DB, c.UserID, noteID) {
+		writeErr(w, http.StatusForbidden, "not_owner", "")
+		return
+	}
+
+	// Optional message body: {"message": "..."} — falls back to autoMessage.
+	var body struct {
+		Message string `json:"message"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	tx, err := s.DB.Begin(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "tx_begin", err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	// Lock-equivalent via FOR UPDATE on the most recent commit row so two
+	// concurrent /commit calls for the same note serialize cleanly.
+	var revTo *int64
+	if err := tx.QueryRow(r.Context(),
+		`SELECT MAX(rev) FROM page_object_revisions
+		 WHERE note_id=$1 AND commit_id IS NULL`, noteID).Scan(&revTo); err != nil {
+		writeErr(w, http.StatusInternalServerError, "rev_query", err.Error())
+		return
+	}
+	if revTo == nil {
+		// No uncommitted revisions — no-op.
+		writeJSON(w, http.StatusOK, map[string]any{"committed": false})
+		return
+	}
+
+	// Count uncommitted revs (for the auto-message).
+	var uncommittedCount int
+	_ = tx.QueryRow(r.Context(),
+		`SELECT COUNT(*) FROM page_object_revisions
+		 WHERE note_id=$1 AND commit_id IS NULL`, noteID).Scan(&uncommittedCount)
+
+	// Parent commit (latest commit so far for this note).
+	var parentID *string
+	var pid string
+	if err := tx.QueryRow(r.Context(),
+		`SELECT id FROM note_commits WHERE note_id=$1 ORDER BY created_at DESC LIMIT 1`,
+		noteID).Scan(&pid); err == nil {
+		parentID = &pid
+	}
+
+	message := body.Message
+	if message == "" {
+		message = fmt.Sprintf("%d change(s)", uncommittedCount)
+	}
+
+	var newCommitID string
+	if err := tx.QueryRow(r.Context(),
+		`INSERT INTO note_commits(note_id, parent_id, user_id, device_id, message, rev_to)
+		 VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+		noteID, parentID, c.UserID, c.DeviceID, message, *revTo).Scan(&newCommitID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "commit_create", err.Error())
+		return
+	}
+
+	// Sweep all uncommitted revisions into this commit.
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE page_object_revisions SET commit_id=$1
+		 WHERE note_id=$2 AND commit_id IS NULL`,
+		newCommitID, noteID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "commit_sweep", err.Error())
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		writeErr(w, http.StatusInternalServerError, "tx_commit", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"committed": true,
+		"commitId":  newCommitID,
+		"revTo":     *revTo,
+		"changes":   uncommittedCount,
+	})
+}
+
 // History returns the list of commits for a note (newest first, up to 100).
 func (s *Service) History(w http.ResponseWriter, r *http.Request) {
 	c, _ := auth.ClaimsFromContext(r.Context())
@@ -635,17 +727,20 @@ func (s *Service) HistorySnapshot(w http.ResponseWriter, r *http.Request) {
 		entry.ParentID = *parentID
 	}
 
+	// Reconstruct true historical state by reading the append-only revisions
+	// log: for each object_id, take its newest revision with rev <= revTo.
+	// Filter out objects whose final state at that point was "deleted".
 	rows, err := s.DB.Query(r.Context(),
-		`SELECT id, page_id, layer_id, kind, data,
-			COALESCE(bbox_minx, 'NaN'::float8),
-			COALESCE(bbox_miny, 'NaN'::float8),
-			COALESCE(bbox_maxx, 'NaN'::float8),
-			COALESCE(bbox_maxy, 'NaN'::float8),
-			rev, deleted, updated_at
-		 FROM page_objects
-		 WHERE page_id IN (SELECT id FROM pages WHERE note_id=$1)
-		   AND rev <= $2 AND deleted = false
-		 ORDER BY rev ASC`,
+		`SELECT DISTINCT ON (object_id)
+		   object_id, page_id, layer_id, kind, data,
+		   COALESCE(bbox_minx, 'NaN'::float8),
+		   COALESCE(bbox_miny, 'NaN'::float8),
+		   COALESCE(bbox_maxx, 'NaN'::float8),
+		   COALESCE(bbox_maxy, 'NaN'::float8),
+		   rev, deleted, committed_at
+		 FROM page_object_revisions
+		 WHERE note_id=$1 AND rev <= $2
+		 ORDER BY object_id, rev DESC`,
 		noteID, revTo)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "snapshot_query", err.Error())
@@ -660,6 +755,11 @@ func (s *Service) HistorySnapshot(w http.ResponseWriter, r *http.Request) {
 		var minx, miny, maxx, maxy float64
 		if err := rows.Scan(&o.ID, &o.PageID, &o.LayerID, &o.Kind, &data,
 			&minx, &miny, &maxx, &maxy, &o.Rev, &o.Deleted, &o.UpdatedAt); err != nil {
+			continue
+		}
+		// At this commit, the object's final state was "deleted" — exclude
+		// from snapshot view.
+		if o.Deleted {
 			continue
 		}
 		o.Data = json.RawMessage(data)
