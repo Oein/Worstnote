@@ -451,8 +451,8 @@ packages:
   goodnotes_parser:
     dependency: "direct main"
     description:
-      path: "/Users/oein/Downloads/notes/goodnotes_parser"
-      relative: false
+      path: "packages/goodnotes_parser"
+      relative: true
     source: path
     version: "0.1.0"
   google_fonts:

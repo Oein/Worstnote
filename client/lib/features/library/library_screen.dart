@@ -80,34 +80,68 @@ Color _folderColorFor(String id) {
 }
 
 const _folderIconMap = <String, IconData>{
-  'folder': Icons.folder_rounded,
-  'star': Icons.star_rounded,
-  'book': Icons.menu_book_rounded,
-  'work': Icons.work_rounded,
-  'home': Icons.home_rounded,
-  'school': Icons.school_rounded,
-  'science': Icons.science_rounded,
-  'palette': Icons.palette_rounded,
-  'music': Icons.music_note_rounded,
-  'sport': Icons.sports_rounded,
-  'travel': Icons.flight_rounded,
-  'code': Icons.code_rounded,
+  // ── 기본
+  'folder':   Icons.folder_rounded,
+  'star':     Icons.star_rounded,
+  'bookmark': Icons.bookmark_rounded,
+
+  // ── 학생 — 과목
+  'book':       Icons.menu_book_rounded,        // 국어·문학
+  'translate':  Icons.translate_rounded,         // 외국어·영어
+  'calculate':  Icons.calculate_rounded,         // 수학
+  'functions':  Icons.functions_rounded,         // 함수·통계
+  'science':    Icons.science_rounded,           // 과학·물리
+  'biotech':    Icons.biotech_rounded,           // 화학·생명
+  'eco':        Icons.eco_rounded,               // 생물·환경
+  'public':     Icons.public_rounded,            // 지리·세계
+  'history':    Icons.history_edu_rounded,       // 역사
+  'groups':     Icons.groups_rounded,            // 사회·윤리
+  'palette':    Icons.palette_rounded,           // 미술
+  'music':      Icons.music_note_rounded,        // 음악
+  'sport':      Icons.sports_soccer_rounded,     // 체육
+  'code':       Icons.code_rounded,              // 컴퓨터·코딩
+  'psychology': Icons.psychology_rounded,        // 심리·도덕
+
+  // ── 학생 — 학업
+  'school':     Icons.school_rounded,            // 학교
+  'assignment': Icons.assignment_rounded,        // 과제·숙제
+  'quiz':       Icons.quiz_rounded,              // 시험·퀴즈
+  'lightbulb':  Icons.lightbulb_rounded,         // 아이디어·창의
+  'article':    Icons.article_rounded,           // 리포트·논문
+
+  // ── 직장인
+  'work':       Icons.work_rounded,              // 업무
+  'business':   Icons.business_center_rounded,   // 비즈니스
+  'meeting':    Icons.people_rounded,            // 회의
+  'chart':      Icons.bar_chart_rounded,         // 데이터·분석
+  'payments':   Icons.payments_rounded,          // 재정·예산
+  'campaign':   Icons.campaign_rounded,          // 마케팅·홍보
+  'gavel':      Icons.gavel_rounded,             // 법률
+  'event':      Icons.event_note_rounded,        // 일정·캘린더
+  'mail':       Icons.mail_rounded,              // 이메일
+  'architecture': Icons.architecture_rounded,   // 설계·디자인
+  'sell':       Icons.sell_rounded,              // 영업·판매
+
+  // ── 일상 / 생활
+  'home':       Icons.home_rounded,              // 집·가정
+  'restaurant': Icons.restaurant_rounded,        // 요리·레시피
+  'shopping':   Icons.shopping_cart_rounded,     // 쇼핑
+  'health':     Icons.monitor_heart_rounded,     // 건강·의료
+  'fitness':    Icons.fitness_center_rounded,    // 운동·헬스
+  'travel':     Icons.flight_rounded,            // 여행
+  'explore':    Icons.explore_rounded,           // 탐험·모험
+  'pets':       Icons.pets_rounded,              // 반려동물
+  'savings':    Icons.savings_rounded,           // 저축·가계부
+  'movie':      Icons.movie_rounded,             // 영화·미디어
+  'child':      Icons.child_care_rounded,        // 육아·아이
+  'meditation': Icons.self_improvement_rounded,  // 명상·취미
+  'car':        Icons.directions_car_rounded,    // 자동차
 };
 
 IconData _folderIconFor(String iconKey) =>
     _folderIconMap[iconKey] ?? Icons.folder_rounded;
 
 // DFS walk returning each folder with its nesting depth.
-List<(Folder, int)> _buildFolderTree(
-    List<Folder> folders, String? parentId, int depth) {
-  final result = <(Folder, int)>[];
-  for (final f in folders.where((f) => f.parentId == parentId)) {
-    result.add((f, depth));
-    result.addAll(_buildFolderTree(folders, f.id, depth + 1));
-  }
-  return result;
-}
-
 // Collects [folderId] itself and all descendant folder IDs recursively.
 Set<String> _allDescendantFolderIds(List<Folder> folders, String folderId) {
   final result = <String>{folderId};
@@ -2328,8 +2362,9 @@ class _FolderTreeState extends State<_FolderTree> {
                   : null,
             ),
             const SizedBox(width: 4),
-            NoteeIconWidget(NoteeIcon.folder,
-                size: 12, color: isSel ? t.accent : t.inkDim),
+            Icon(_folderIconFor(f.iconKey),
+                size: 14,
+                color: isSel ? t.accent : Color(f.colorArgb)),
             const SizedBox(width: 6),
             Expanded(
               child: Text(
@@ -2781,7 +2816,17 @@ class _MainAreaState extends ConsumerState<_MainArea> {
                 ? () async {
                     final f = folders.where((f) => f.id == _selectedFolderIds.first).cast<Folder?>().firstOrNull;
                     if (f == null || !context.mounted) return;
-                    await _showFolderContextMenu(context, ref, f, Offset.zero);
+                    final result2 = await showDialog<(int, String)>(
+                      context: context,
+                      builder: (_) => _FolderAppearanceDialog(
+                        initialColor: f.colorArgb,
+                        initialIconKey: f.iconKey,
+                      ),
+                    );
+                    if (result2 != null && context.mounted) {
+                      await ref.read(libraryProvider.notifier)
+                          .updateFolderAppearance(f.id, result2.$1, result2.$2);
+                    }
                     _exitSelectionMode();
                   }
                 : null,
@@ -4514,15 +4559,82 @@ Future<String?> _pickFolder(
 }) async {
   final lib = ref.read(libraryProvider).value;
   if (lib == null) return null;
-  final t = NoteeProvider.of(context).tokens;
 
   return showDialog<String>(
     context: context,
-    builder: (_) => Dialog(
+    builder: (_) => _FolderPickerDialog(
+      folders: lib.folders,
+      currentFolderId: currentFolderId,
+      excludeFolderIds: excludeFolderIds,
+    ),
+  );
+}
+
+// ── Folder picker dialog (collapsible tree) ────────────────────────────
+
+class _FolderPickerDialog extends StatefulWidget {
+  const _FolderPickerDialog({
+    required this.folders,
+    this.currentFolderId,
+    this.excludeFolderIds = const {},
+  });
+  final List<Folder> folders;
+  final String? currentFolderId;
+  final Set<String> excludeFolderIds;
+
+  @override
+  State<_FolderPickerDialog> createState() => _FolderPickerDialogState();
+}
+
+class _FolderPickerDialogState extends State<_FolderPickerDialog> {
+  // Folders whose children are collapsed. Initialised to ALL folders that
+  // have children so the tree starts fully collapsed.
+  late final Set<String> _collapsed;
+
+  @override
+  void initState() {
+    super.initState();
+    _collapsed = widget.folders
+        .where((f) => widget.folders.any((c) => c.parentId == f.id))
+        .map((f) => f.id)
+        .toSet();
+  }
+
+  List<Folder> _childrenOf(String? parentId) => widget.folders
+      .where((f) => f.parentId == parentId)
+      .toList()
+    ..sort((a, b) => a.name.compareTo(b.name));
+
+  bool _hasChildren(String id) =>
+      widget.folders.any((f) => f.parentId == id);
+
+  /// Returns the flat list of visible (f, depth) pairs, skipping subtrees
+  /// whose parent is in [_collapsed].
+  List<(Folder, int)> _visibleItems() {
+    final result = <(Folder, int)>[];
+    void visit(String? parentId, int depth) {
+      for (final f in _childrenOf(parentId)) {
+        if (widget.excludeFolderIds.contains(f.id)) continue;
+        result.add((f, depth));
+        if (!_collapsed.contains(f.id)) {
+          visit(f.id, depth + 1);
+        }
+      }
+    }
+    visit(null, 0);
+    return result;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    final items = _visibleItems();
+
+    return Dialog(
       backgroundColor: t.toolbar,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 320, maxHeight: 420),
+        constraints: const BoxConstraints(maxWidth: 320, maxHeight: 480),
         child: Padding(
           padding: const EdgeInsets.all(16),
           child: Column(
@@ -4543,6 +4655,7 @@ Future<String?> _pickFolder(
                 child: ListView(
                   shrinkWrap: true,
                   children: [
+                    // Root option
                     ListTile(
                       leading: Icon(Icons.home_outlined, color: t.ink),
                       title: Text(
@@ -4552,31 +4665,29 @@ Future<String?> _pickFolder(
                           color: t.ink,
                         ),
                       ),
-                      selected: currentFolderId == null,
+                      selected: widget.currentFolderId == null,
                       onTap: () => Navigator.of(context).pop('__root__'),
                     ),
-                    for (final (f, depth)
-                        in _buildFolderTree(lib.folders, null, 0))
-                      if (!excludeFolderIds.contains(f.id))
-                        Padding(
-                          padding: EdgeInsets.only(left: depth * 16.0),
-                          child: ListTile(
-                            dense: true,
-                            leading: Icon(
-                              _folderIconFor(f.iconKey),
-                              color: Color(f.colorArgb),
-                            ),
-                            title: Text(
-                              f.name,
-                              style: TextStyle(
-                                fontFamily: 'Inter Tight',
-                                color: t.ink,
-                              ),
-                            ),
-                            selected: currentFolderId == f.id,
-                            onTap: () => Navigator.of(context).pop(f.id),
-                          ),
-                        ),
+                    // Folder tree rows
+                    for (final (f, depth) in items)
+                      _FolderPickerRow(
+                        folder: f,
+                        depth: depth,
+                        selected: widget.currentFolderId == f.id,
+                        hasChildren: _hasChildren(f.id) &&
+                            !widget.excludeFolderIds.contains(f.id),
+                        collapsed: _collapsed.contains(f.id),
+                        onTap: () => Navigator.of(context).pop(f.id),
+                        onToggleCollapse: _hasChildren(f.id)
+                            ? () => setState(() {
+                                  if (_collapsed.contains(f.id)) {
+                                    _collapsed.remove(f.id);
+                                  } else {
+                                    _collapsed.add(f.id);
+                                  }
+                                })
+                            : null,
+                      ),
                   ],
                 ),
               ),
@@ -4598,8 +4709,86 @@ Future<String?> _pickFolder(
           ),
         ),
       ),
-    ),
-  );
+    );
+  }
+}
+
+class _FolderPickerRow extends StatelessWidget {
+  const _FolderPickerRow({
+    required this.folder,
+    required this.depth,
+    required this.selected,
+    required this.hasChildren,
+    required this.collapsed,
+    required this.onTap,
+    this.onToggleCollapse,
+  });
+  final Folder folder;
+  final int depth;
+  final bool selected;
+  final bool hasChildren;
+  final bool collapsed;
+  final VoidCallback onTap;
+  final VoidCallback? onToggleCollapse;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    return Padding(
+      padding: EdgeInsets.only(left: depth * 16.0),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          decoration: BoxDecoration(
+            color: selected ? t.accentSoft : Colors.transparent,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+          child: Row(children: [
+            // Collapse/expand chevron
+            SizedBox(
+              width: 20,
+              child: hasChildren
+                  ? GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: onToggleCollapse,
+                      child: Icon(
+                        collapsed
+                            ? Icons.chevron_right_rounded
+                            : Icons.expand_more_rounded,
+                        size: 16,
+                        color: t.inkDim,
+                      ),
+                    )
+                  : null,
+            ),
+            const SizedBox(width: 4),
+            // Folder icon
+            Icon(
+              _folderIconFor(folder.iconKey),
+              color: Color(folder.colorArgb),
+              size: 20,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                folder.name,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontFamily: 'Inter Tight',
+                  fontSize: 13,
+                  color: t.ink,
+                  fontWeight:
+                      selected ? FontWeight.w600 : FontWeight.w500,
+                ),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
 }
 
 // ── Folder appearance dialog ────────────────────────────────────────────

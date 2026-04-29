@@ -48,9 +48,9 @@ dependencies:
   # Typography from the design handoff (Newsreader, JetBrains Mono).
   google_fonts: ^6.2.1
 
-  # GoodNotes 5/6 (.goodnotes) package importer (path dep, vendored).
+  # GoodNotes 5/6 (.goodnotes) package importer (path dep, vendored into repo).
   goodnotes_parser:
-    path: /Users/oein/Downloads/notes/goodnotes_parser
+    path: packages/goodnotes_parser
 
   # Persistent tool/eraser preferences across app launches.
   shared_preferences: ^2.3.0
