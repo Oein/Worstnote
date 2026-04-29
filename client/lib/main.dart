@@ -1042,36 +1042,52 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  if (_headerVisible)
-                    _EditorTopBar(
-                      noteId: note.id,
-                      stylusOnly: stylusOnly,
-                      showPages: _showPages,
-                      activePageIndex: _activePageIndex,
-                      totalPages: state.pages.length,
-                      onTogglePages: _togglePages,
-                      onBack: () => _closeEditor(),
-                      onTitleChanged: ctl.setTitle,
-                      onToggleStylusOnly: () => ref.read(toolProvider.notifier).setInputDrawMode(
-                        stylusOnly ? InputDrawMode.any : InputDrawMode.stylusOnly,
+                  ClipRect(
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 220),
+                      curve: Curves.easeInOut,
+                      height: _headerVisible ? 44.0 : 0.0,
+                      child: _EditorTopBar(
+                        noteId: note.id,
+                        stylusOnly: stylusOnly,
+                        showPages: _showPages,
+                        activePageIndex: _activePageIndex,
+                        totalPages: state.pages.length,
+                        onTogglePages: _togglePages,
+                        onBack: () => _closeEditor(),
+                        onTitleChanged: ctl.setTitle,
+                        onToggleStylusOnly: () => ref.read(toolProvider.notifier).setInputDrawMode(
+                          stylusOnly ? InputDrawMode.any : InputDrawMode.stylusOnly,
+                        ),
+                        onScrollToPage: (i) => _scrollerKey.currentState?.scrollToPage(i),
+                        onToggleHeader: () => setState(() => _headerVisible = false),
                       ),
-                      onScrollToPage: (i) => _scrollerKey.currentState?.scrollToPage(i),
-                      onToggleHeader: () => setState(() => _headerVisible = false),
                     ),
+                  ),
                   if (dock == ToolbarDock.top) toolbar,
                   canvasArea,
                   if (dock == ToolbarDock.bottom) toolbar,
                 ],
               ),
             ),
-            if (!_headerVisible)
-              Positioned(
-                top: 8,
-                right: 8,
-                child: _FloatingHeaderRestoreBtn(
-                  onRestore: () => setState(() => _headerVisible = true),
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeInOut,
+              top: _headerVisible
+                  ? -48.0
+                  : (dock == ToolbarDock.top ? 96.0 + 8 : 8.0),
+              right: 8,
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 180),
+                opacity: _headerVisible ? 0.0 : 1.0,
+                child: IgnorePointer(
+                  ignoring: _headerVisible,
+                  child: _FloatingHeaderRestoreBtn(
+                    onRestore: () => setState(() => _headerVisible = true),
+                  ),
                 ),
               ),
+            ),
           ],
         ),
       ),
@@ -1349,7 +1365,7 @@ class _NoteSettingsBtnState extends ConsumerState<_NoteSettingsBtn> {
       key: _key,
       child: IconButton(
         tooltip: 'Settings',
-        icon: NoteeIconWidget(NoteeIcon.gear, size: 16, color: t.ink),
+        icon: Icon(Icons.settings, size: 18, color: t.ink),
         onPressed: _open,
       ),
     );
@@ -1966,22 +1982,21 @@ class _FloatingHeaderRestoreBtn extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      color: Colors.transparent,
-      child: Ink(
+    final t = NoteeProvider.of(context).tokens;
+    return GestureDetector(
+      onTap: onRestore,
+      child: Container(
+        width: 36,
+        height: 36,
         decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.85),
+          color: t.toolbar,
           shape: BoxShape.circle,
-          boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 6)],
+          border: Border.all(color: t.tbBorder, width: 0.5),
+          boxShadow: const [
+            BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 2)),
+          ],
         ),
-        child: InkWell(
-          onTap: onRestore,
-          customBorder: const CircleBorder(),
-          child: const Padding(
-            padding: EdgeInsets.all(8),
-            child: Icon(Icons.fullscreen_exit, size: 20),
-          ),
-        ),
+        child: Icon(Icons.fullscreen_exit, size: 18, color: t.ink),
       ),
     );
   }
