@@ -987,12 +987,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         );
                       }),
                     ),
-                    // Cloud sync status — top-left corner of canvas.
-                    const Positioned(
-                      left: 10,
-                      top: 10,
-                      child: _CanvasCloudStatus(),
-                    ),
                     // Zoom-reset button — shown when not at 100%.
                     ValueListenableBuilder<double>(
                       valueListenable: _zoomNotifier,
@@ -1820,65 +1814,6 @@ class _FloatingSideActionsState extends ConsumerState<_FloatingSideActions> {
   }
 }
 
-// ─── Canvas cloud status chip (top-left of note canvas) ──────────────────
-
-class _CanvasCloudStatus extends ConsumerWidget {
-  const _CanvasCloudStatus();
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final cloud = ref.watch(cloudSyncProvider);
-
-    if (cloud.status == CloudSyncStatus.notLoggedIn) return const SizedBox.shrink();
-
-    final icon = switch (cloud.status) {
-      CloudSyncStatus.notLoggedIn => Icons.cloud_outlined,
-      CloudSyncStatus.idle        => Icons.cloud,
-      CloudSyncStatus.checking    => Icons.sync,
-      CloudSyncStatus.syncing     => Icons.sync,
-      CloudSyncStatus.ok          => Icons.cloud_done,
-      CloudSyncStatus.error       => Icons.cloud_off,
-    };
-
-    final String label;
-    if (cloud.status == CloudSyncStatus.syncing &&
-        cloud.syncTotal != null && cloud.syncTotal! > 0) {
-      label = '동기화중… (${cloud.syncCurrent ?? 0}/${cloud.syncTotal})';
-    } else {
-      label = switch (cloud.status) {
-        CloudSyncStatus.notLoggedIn => '',
-        CloudSyncStatus.idle        => '연결됨',
-        CloudSyncStatus.checking    => '확인 중',
-        CloudSyncStatus.syncing     => '동기화중…',
-        CloudSyncStatus.ok          => '연결됨',
-        CloudSyncStatus.error       => '오프라인',
-      };
-    }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.45),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Icon(icon, size: 12, color: Colors.white70),
-        if (label.isNotEmpty) ...[
-          const SizedBox(width: 4),
-          Text(
-            label,
-            style: const TextStyle(
-              color: Colors.white70,
-              fontFamily: 'Inter Tight',
-              fontSize: 11,
-            ),
-          ),
-        ],
-      ]),
-    );
-  }
-}
-
 // ─── Editor Cloud Button ───────────────────────────────────────────────────
 
 class _EditorCloudButton extends ConsumerStatefulWidget {
@@ -1892,6 +1827,7 @@ class _EditorCloudButton extends ConsumerStatefulWidget {
 
 class _EditorCloudButtonState extends ConsumerState<_EditorCloudButton>
     with SingleTickerProviderStateMixin {
+  final _key = GlobalKey();
   late final AnimationController _spin;
 
   @override
@@ -1961,17 +1897,23 @@ class _EditorCloudButtonState extends ConsumerState<_EditorCloudButton>
       iconWidget = RotationTransition(turns: _spin, child: iconWidget);
     }
 
-    return IconButton(
-      tooltip: tooltip,
-      icon: iconWidget,
-      onPressed: _openModal,
+    return KeyedSubtree(
+      key: _key,
+      child: IconButton(
+        tooltip: tooltip,
+        icon: iconWidget,
+        onPressed: _openPopover,
+      ),
     );
   }
 
-  Future<void> _openModal() async {
-    await showDialog<void>(
-      context: context,
-      builder: (_) => _EditorCloudDialog(onSyncNow: widget.onSyncNow),
+  Future<void> _openPopover() async {
+    dismissActivePassthroughPopover();
+    await showNoteePopover<void>(
+      context,
+      anchorKey: _key,
+      maxWidth: 240,
+      builder: (_) => _CloudSyncPopoverContent(onSyncNow: widget.onSyncNow),
     );
   }
 }
@@ -2002,23 +1944,36 @@ class _FloatingHeaderRestoreBtn extends StatelessWidget {
   }
 }
 
-class _EditorCloudDialog extends ConsumerWidget {
-  const _EditorCloudDialog({required this.onSyncNow});
+class _CloudSyncPopoverContent extends ConsumerWidget {
+  const _CloudSyncPopoverContent({required this.onSyncNow});
   final VoidCallback? onSyncNow;
+
+  String _relTime(DateTime t) {
+    final d = DateTime.now().toUtc().difference(t.toUtc());
+    if (d.inSeconds < 60) return '방금 전';
+    if (d.inMinutes < 60) return '${d.inMinutes}분 전';
+    if (d.inHours < 24) return '${d.inHours}시간 전';
+    return '${d.inDays}일 전';
+  }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final t = NoteeProvider.of(context).tokens;
     final cloud = ref.watch(cloudSyncProvider);
-    final loggedIn = ref.watch(authProvider).value?.isLoggedIn ?? false;
+    final pendingAssets = ref.watch(pendingAssetNotesProvider);
+    final conflicts = ref.watch(pendingConflictsProvider);
 
-    final (icon, iconColor) = switch (cloud.status) {
-      CloudSyncStatus.notLoggedIn => (Icons.cloud_outlined, t.inkFaint),
-      CloudSyncStatus.idle        => (Icons.cloud,          t.accent),
-      CloudSyncStatus.checking    => (Icons.sync,           t.accent),
-      CloudSyncStatus.syncing     => (Icons.sync,           t.accent),
-      CloudSyncStatus.ok          => (Icons.cloud_done,     const Color(0xFF4CAF50)),
-      CloudSyncStatus.error       => (Icons.cloud_off,      t.inkFaint),
+    final rowStyle = TextStyle(fontFamily: 'Inter Tight', fontSize: 13, color: t.ink);
+    final dimStyle = TextStyle(fontFamily: 'Inter Tight', fontSize: 12, color: t.inkDim);
+
+    // ── Status icon + label ─────────────────────────────────────────────
+    final (statusIcon, statusColor) = switch (cloud.status) {
+      CloudSyncStatus.notLoggedIn => (Icons.cloud_outlined,  t.inkFaint),
+      CloudSyncStatus.idle        => (Icons.cloud_done,      t.accent),
+      CloudSyncStatus.checking    => (Icons.sync,            t.accent),
+      CloudSyncStatus.syncing     => (Icons.sync,            t.accent),
+      CloudSyncStatus.ok          => (Icons.cloud_done,      t.accent),
+      CloudSyncStatus.error       => (Icons.cloud_off,       t.inkFaint),
     };
 
     final String statusLabel;
@@ -2028,123 +1983,86 @@ class _EditorCloudDialog extends ConsumerWidget {
     } else {
       statusLabel = switch (cloud.status) {
         CloudSyncStatus.notLoggedIn => '로그인 필요',
-        CloudSyncStatus.idle        => '연결됨',
-        CloudSyncStatus.checking    => '확인 중…',
+        CloudSyncStatus.idle        => '동기화됨',
+        CloudSyncStatus.checking    => '연결 확인 중…',
         CloudSyncStatus.syncing     => '동기화중…',
-        CloudSyncStatus.ok          => '연결됨',
+        CloudSyncStatus.ok          => '동기화됨',
         CloudSyncStatus.error       => '오프라인',
       };
     }
 
-    final labelStyle = TextStyle(
-      fontFamily: 'Inter Tight',
-      fontSize: 13,
-      color: t.inkDim,
+    Widget infoRow(IconData icon, Color color, String text) => Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(children: [
+        Icon(icon, size: 14, color: color),
+        const SizedBox(width: 8),
+        Expanded(child: Text(text, style: rowStyle)),
+      ]),
     );
 
-    return Dialog(
-      backgroundColor: t.toolbar,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 300),
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(children: [
-                Icon(icon, size: 18, color: iconColor),
-                const SizedBox(width: 8),
-                Text(
-                  statusLabel,
-                  style: TextStyle(
-                    fontFamily: 'Newsreader',
-                    fontSize: 18,
-                    fontWeight: FontWeight.w600,
-                    color: t.ink,
-                  ),
-                ),
-              ]),
-              if (cloud.serverUrl != null) ...[
-                const SizedBox(height: 6),
-                Text(
-                  cloud.serverUrl!,
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 11,
-                    color: t.inkFaint,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ],
-              if (cloud.errorMessage != null) ...[
-                const SizedBox(height: 6),
-                Text(
-                  cloud.errorMessage!,
-                  style: const TextStyle(
-                    fontFamily: 'Inter Tight',
-                    fontSize: 11,
-                    color: Color(0xFFDC2626),
-                  ),
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ],
-              const SizedBox(height: 16),
-              Divider(height: 1, thickness: 1, color: t.tbBorder),
-              const SizedBox(height: 12),
-              if (!loggedIn)
-                TextButton.icon(
-                  icon: Icon(Icons.login, size: 16, color: t.accent),
-                  label: Text('로그인', style: TextStyle(color: t.accent, fontFamily: 'Inter Tight', fontSize: 13)),
-                  onPressed: () {
-                    Navigator.pop(context);
-                    showDialog<void>(
-                      context: context,
-                      builder: (_) => const LoginDialog(),
-                    );
-                  },
-                )
-              else ...[
-                if (onSyncNow != null)
-                  TextButton.icon(
-                    icon: Icon(Icons.sync, size: 16, color: t.accent),
-                    label: Text('지금 동기화', style: labelStyle.copyWith(color: t.accent)),
-                    onPressed: () {
-                      Navigator.pop(context);
-                      onSyncNow!();
-                    },
-                  ),
-                TextButton.icon(
-                  icon: Icon(Icons.refresh, size: 16, color: t.inkDim),
-                  label: Text('연결 확인', style: labelStyle),
-                  onPressed: () {
-                    Navigator.pop(context);
-                    ref.read(cloudSyncProvider.notifier).checkNow();
-                  },
-                ),
-                TextButton.icon(
-                  icon: const Icon(Icons.logout, size: 16, color: Color(0xFFDC2626)),
-                  label: Text('로그아웃', style: labelStyle.copyWith(color: const Color(0xFFDC2626))),
-                  onPressed: () {
-                    Navigator.pop(context);
-                    ref.read(authProvider.notifier).logout();
-                  },
-                ),
-              ],
-              const SizedBox(height: 4),
-              Align(
-                alignment: Alignment.centerRight,
-                child: TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: Text('닫기', style: TextStyle(fontFamily: 'Inter Tight', fontSize: 13, color: t.inkDim)),
-                ),
+    return Padding(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Status
+          infoRow(statusIcon, statusColor, statusLabel),
+          // Error message
+          if (cloud.errorMessage != null) ...[
+            const SizedBox(height: 2),
+            Padding(
+              padding: const EdgeInsets.only(left: 22),
+              child: Text(
+                cloud.errorMessage!,
+                style: dimStyle.copyWith(color: const Color(0xFFDC2626)),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
               ),
-            ],
-          ),
-        ),
+            ),
+          ],
+          // Last synced
+          if (cloud.lastCheckedAt != null) ...[
+            const SizedBox(height: 2),
+            Padding(
+              padding: const EdgeInsets.only(left: 22),
+              child: Text('마지막 동기화: ${_relTime(cloud.lastCheckedAt!)}', style: dimStyle),
+            ),
+          ],
+          // Pending asset uploads
+          if (pendingAssets.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            infoRow(Icons.upload_outlined, Colors.orange,
+                '업로드 대기: ${pendingAssets.length}개 노트'),
+          ],
+          // Pending conflicts
+          if (conflicts.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            infoRow(Icons.sync_problem, Colors.orange,
+                '충돌 발생: ${conflicts.length}개 노트'),
+          ],
+          // Sync now button
+          if (onSyncNow != null && cloud.status != CloudSyncStatus.notLoggedIn) ...[
+            const SizedBox(height: 8),
+            Divider(height: 1, color: t.tbBorder),
+            const SizedBox(height: 4),
+            SizedBox(
+              width: double.infinity,
+              child: TextButton.icon(
+                style: TextButton.styleFrom(
+                  alignment: Alignment.centerLeft,
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+                ),
+                icon: Icon(Icons.sync, size: 15, color: t.accent),
+                label: Text('지금 동기화', style: rowStyle.copyWith(color: t.accent)),
+                onPressed: () {
+                  dismissActivePassthroughPopover();
+                  onSyncNow!();
+                },
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
