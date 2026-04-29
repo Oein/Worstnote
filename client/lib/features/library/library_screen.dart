@@ -1509,10 +1509,17 @@ class _ConflictResolutionDialogState
     final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
     setState(() => _applying = true);
     try {
-      await api.conflictResolve(widget.noteId, widget.sessionId, [
+      final result = await api.conflictResolve(widget.noteId, widget.sessionId, [
         for (final entry in _picks.entries)
           {'itemId': entry.key, 'resolution': entry.value},
       ]);
+      // Advance cursor to the server's resolved rev BEFORE the next push.
+      // Without this, the next syncNow() push would still use the pre-conflict
+      // lastServerRev and re-trigger the same conflict.
+      final resolvedRev = (result['serverRev'] as num?)?.toInt() ?? 0;
+      if (resolvedRev > 0) {
+        await ref.read(syncActionsProvider).updateCursor(widget.noteId, resolvedRev);
+      }
       // Server applied the picks — drop the local pending entry.
       await ref.read(pendingConflictsProvider.notifier).clear(widget.noteId);
       // Pull the resolved state back so the local DB picks up the chosen

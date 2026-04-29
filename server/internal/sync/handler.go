@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"regexp"
 	"time"
 
@@ -368,7 +369,7 @@ func (s *Service) Push(w http.ResponseWriter, r *http.Request) {
 			// Data-level deduplication: if the client's version is byte-for-byte
 			// identical to what the server already has (same data + deleted flag),
 			// there is no real conflict — just acknowledge the server rev.
-			if bytes.Equal(ch.Data, existingData) && ch.Deleted == existingDeleted {
+			if jsonSemanticEqual(ch.Data, existingData) && ch.Deleted == existingDeleted {
 				resp.Accepted = append(resp.Accepted, acceptedObject{ID: ch.ID, ServerRev: existingRev})
 				if existingRev > resp.ServerRev {
 					resp.ServerRev = existingRev
@@ -1265,6 +1266,66 @@ func parseInt64(s string) (int64, error) {
 		v = v*10 + int64(c-'0')
 	}
 	return v, nil
+}
+
+// jsonSemanticEqual compares two JSON byte slices for semantic equality.
+// This matters because Postgres jsonb canonicalises (key order, whitespace,
+// numeric formatting) so the bytes coming back from `existingData` are NOT
+// the same bytes the client originally wrote — even when the underlying
+// data is identical. Strict bytes.Equal therefore produces false-positive
+// "conflicts" on every sync where the same object round-trips through the DB.
+//
+// Strategy: try a fast bytes.Equal first; if that fails, parse both sides
+// into untyped values and DeepEqual them. Numbers go through json.Number so
+// 1 vs 1.0 stays distinct (matches what the client/server actually wrote).
+func jsonSemanticEqual(a, b []byte) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	if bytes.Equal(a, b) {
+		return true
+	}
+	var av, bv any
+	da := json.NewDecoder(bytes.NewReader(a))
+	da.UseNumber()
+	if err := da.Decode(&av); err != nil {
+		return false
+	}
+	db := json.NewDecoder(bytes.NewReader(b))
+	db.UseNumber()
+	if err := db.Decode(&bv); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(canonicalNumbers(av), canonicalNumbers(bv))
+}
+
+// canonicalNumbers walks a parsed JSON value and converts every json.Number
+// into a normalised string form so that "1" and "1.0", or "0.10" and "0.1",
+// compare equal — Postgres's jsonb does this normalisation on the way in.
+func canonicalNumbers(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, v := range x {
+			out[k] = canonicalNumbers(v)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = canonicalNumbers(e)
+		}
+		return out
+	case json.Number:
+		// Always coerce to float64 so "1" and "1.0", or "0.10" and "0.1",
+		// compare equal — jsonb normalises numerically, not lexically.
+		// Fall back to original string only if the number is too big.
+		if f, err := x.Float64(); err == nil {
+			return f
+		}
+		return x.String()
+	}
+	return v
 }
 
 func writeJSON(w http.ResponseWriter, code int, body any) {

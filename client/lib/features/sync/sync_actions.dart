@@ -398,6 +398,11 @@ class SyncActions {
     } catch (_) {}
   }
 
+  /// Publicly expose cursor update so conflict resolution can advance the
+  /// cursor to the server's resolved rev before the next push.
+  Future<void> updateCursor(String noteId, int serverRev) =>
+      _saveCursor(noteId, serverRev);
+
   // Unified asset transfer queue (uploads + downloads).
   // Priority: p0 (user-requested) > p1 (current session) > p2 (background).
   final List<_AssetJob> _jobQueue = [];
@@ -883,6 +888,12 @@ class SyncActions {
     final cursors = await _loadedCursors();
     final lastKnownRev = cursors[notebook.note.id] ?? 0;
     final pushed = await _push(api, notebook, lastServerRev: lastKnownRev);
+    // Always advance cursor from push result — even when a conflict was
+    // detected, the server returns its current rev so the *next* push uses
+    // the correct lastServerRev and doesn't re-trigger the same conflict.
+    if (pushed.serverRev > lastKnownRev) {
+      await _saveCursor(notebook.note.id, pushed.serverRev);
+    }
     final effectiveSince = since ?? cursors[notebook.note.id] ?? 0;
     final pulled = await _pull(api, notebook, since: effectiveSince);
     await _saveCursor(notebook.note.id, pulled.cursor);

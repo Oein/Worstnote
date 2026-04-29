@@ -596,6 +596,8 @@ class _SnapshotPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    // Draw white page background first.
+    canvas.drawRect(Offset.zero & size, Paint()..color = const Color(0xFFFFFFFF));
     canvas.save();
     canvas.scale(scale, scale);
     canvas.translate(offsetX, offsetY);

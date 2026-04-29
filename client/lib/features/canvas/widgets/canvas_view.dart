@@ -2589,7 +2589,9 @@ class _CursorOverlayState extends ConsumerState<_CursorOverlay> {
     final ts = ref.watch(toolProvider);
     final double r;
     Color? fill;
-    final isPen = !widget.isTempErasing && widget.appTool == AppTool.pen;
+    // pen tool now uses a filled disc just like highlighter — shows the actual
+    // stroke tip (color + size) at the cursor position instead of a crosshair.
+    const isPen = false;
     if (widget.isTempErasing) {
       r = effectiveEraserRadius(ts).clamp(1.0, 80.0);
     } else {
@@ -2603,12 +2605,11 @@ class _CursorOverlayState extends ConsumerState<_CursorOverlay> {
         case AppTool.tape:
           r = (ts.tapeWidth / 2).clamp(0.5, 80.0);
           fill = Color(ts.tapeColor);
-        default: // pen
-          // For pen cursor we use the ring+crosshair style (isPen=true).
-          // The ring radius uses a minimum of 4pt so it is always visible
-          // regardless of the pen width setting.
-          r = (ts.penWidth / 2).clamp(4.0, 80.0);
-          fill = Color(ts.penColor); // passed as accent color for crosshair
+        default: // pen — filled disc in pen color/size
+          // Allow sub-pt radii (e.g. penWidth=0.7 → r=0.35) so the cursor
+          // truly matches the stroke. Lower bound is just to avoid 0.
+          r = (ts.penWidth / 2).clamp(0.1, 80.0);
+          fill = Color(ts.penColor);
       }
     }
 

@@ -158,6 +158,36 @@ func main() {
 		log.Printf("  [FIX] ✓ no conflict  serverRev=%d\n", resp7fix.ServerRev)
 	}
 
+	// ── 8. Semantic JSON dedup test ──────────────────────────────────────────
+	// Push *the same* logical object with reordered keys / different number
+	// formatting, lastServerRev=0. After the rev-based conflict trigger, the
+	// server should detect the data is semantically identical and skip
+	// creating a conflict session.
+	log.Println("\n=== 8. Semantic dedup test ===")
+	dedupNoteID := newUUID()
+	dedupPageID := newUUID()
+	dedupLayerID := newUUID()
+	dedupObjID := newUUID()
+	// First push — two-key payload, key order A then B.
+	log.Println("  Push #1 (device A, lastServerRev=0):  data={\"a\":1,\"b\":2.0}")
+	r8a := mustPushRaw(baseURL, tokens.AccessToken, dedupNoteID, dedupPageID, dedupLayerID, dedupObjID,
+		json.RawMessage(`{"a":1,"b":2.0}`), 0)
+	log.Printf("    serverRev=%d  conflict=%q\n", r8a.ServerRev, r8a.ConflictSessionID)
+	// Second push — SAME logical data, different bytes:
+	//   - keys reordered (b before a)
+	//   - numbers re-formatted (2.0 → 2; 1 → 1.0)
+	// + lastServerRev=0 forces the server into the rev-conflict branch.
+	log.Println("  Push #2 (device B, lastServerRev=0):  data={\"b\":2,\"a\":1.0}  ← same logical value, different bytes")
+	tokensC := mustLogin(baseURL, testEmail, testPass, "test-device-C")
+	r8b := mustPushRaw(baseURL, tokensC.AccessToken, dedupNoteID, dedupPageID, dedupLayerID, dedupObjID,
+		json.RawMessage(`{"b":2,"a":1.0}`), 0)
+	if r8b.ConflictSessionID != "" {
+		log.Printf("    ❌ FALSE CONFLICT — semantic dedup failed  serverRev=%d  sid=%s\n",
+			r8b.ServerRev, r8b.ConflictSessionID)
+	} else {
+		log.Printf("    ✓ correctly deduped — no conflict  serverRev=%d\n", r8b.ServerRev)
+	}
+
 	log.Println("\n=== SUMMARY ===")
 	log.Printf("  Conflict push serverRev:     %d  (should be R1=%d, NOT 0)\n", resp3.ServerRev, resp2.ServerRev)
 	log.Printf("  ResolveConflict serverRev:   %d  (should be >=R1=%d, NOT 0)\n", resolveResp.ServerRev, resp2.ServerRev)
@@ -222,6 +252,10 @@ func mustLogin(baseURL, email, pass, device string) tokenResp {
 	var t tokenResp
 	mustDecode(r, &t)
 	return t
+}
+
+func mustPushRaw(baseURL, token, noteID, pageID, layerID, objID string, data json.RawMessage, lastServerRev int64) pushResp {
+	return mustPush(baseURL, token, noteID, pageID, layerID, objID, string(data), lastServerRev)
 }
 
 func mustPush(baseURL, token, noteID, pageID, layerID, objID, data string, lastServerRev int64) pushResp {
