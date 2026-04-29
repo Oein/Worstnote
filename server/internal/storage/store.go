@@ -4,6 +4,7 @@ package storage
 import (
 	"context"
 	"io"
+	"strings"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -16,8 +17,12 @@ type Store struct {
 }
 
 // New creates a Store connected to the given MinIO endpoint.
+// endpoint may be a full URL ("http://minio:9000") or host:port ("minio:9000").
 func New(endpoint, accessKey, secretKey, bucket string, useSSL bool) (*Store, error) {
-	client, err := minio.New(endpoint, &minio.Options{
+	// MinIO SDK wants host:port without a scheme.
+	ep := strings.TrimPrefix(endpoint, "https://")
+	ep = strings.TrimPrefix(ep, "http://")
+	client, err := minio.New(ep, &minio.Options{
 		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
 		Secure: useSSL,
 	})
