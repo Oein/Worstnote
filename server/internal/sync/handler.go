@@ -9,6 +9,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -356,13 +357,24 @@ func (s *Service) Push(w http.ResponseWriter, r *http.Request) {
 	for _, ch := range req.Changes {
 		var existingData []byte
 		var existingRev int64
+		var existingDeleted bool
 		var existingUpdatedAt *time.Time
 		row := tx.QueryRow(r.Context(),
-			`SELECT updated_at, data, rev FROM page_objects WHERE id=$1`, ch.ID)
-		_ = row.Scan(&existingUpdatedAt, &existingData, &existingRev)
+			`SELECT updated_at, data, rev, deleted FROM page_objects WHERE id=$1`, ch.ID)
+		_ = row.Scan(&existingUpdatedAt, &existingData, &existingRev, &existingDeleted)
 
 		// Rev-based conflict: server modified this object after client's last sync.
 		if existingUpdatedAt != nil && existingRev > req.LastServerRev {
+			// Data-level deduplication: if the client's version is byte-for-byte
+			// identical to what the server already has (same data + deleted flag),
+			// there is no real conflict — just acknowledge the server rev.
+			if bytes.Equal(ch.Data, existingData) && ch.Deleted == existingDeleted {
+				resp.Accepted = append(resp.Accepted, acceptedObject{ID: ch.ID, ServerRev: existingRev})
+				if existingRev > resp.ServerRev {
+					resp.ServerRev = existingRev
+				}
+				continue
+			}
 			resp.Conflicts = append(resp.Conflicts, conflictedObject{
 				ID:            ch.ID,
 				Winner:        "server",

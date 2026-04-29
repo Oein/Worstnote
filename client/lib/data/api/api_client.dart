@@ -23,12 +23,18 @@ class AuthTokens {
 
 typedef OnTokens = void Function(AuthTokens tokens);
 
+/// Called when a refresh attempt fails with 401 — the server has invalidated
+/// the refresh token (e.g. it was already rotated). The caller should clear
+/// auth state so the user is prompted to re-login.
+typedef OnLogout = void Function();
+
 class ApiClient {
   ApiClient({
     required this.baseUrl,
     required this.deviceId,
     AuthTokens? tokens,
     this.onTokens,
+    this.onLogout,
   })  : _tokens = tokens,
         _dio = Dio(BaseOptions(
           baseUrl: baseUrl,
@@ -40,6 +46,7 @@ class ApiClient {
   final String baseUrl;
   final String deviceId;
   final OnTokens? onTokens;
+  final OnLogout? onLogout;
   final Dio _dio;
   AuthTokens? _tokens;
 
@@ -295,7 +302,18 @@ class ApiClient {
       return await fn();
     } on DioException catch (e) {
       if (e.response?.statusCode == 401 && _tokens != null) {
-        await refresh();
+        try {
+          await refresh();
+        } on DioException catch (re) {
+          // Refresh itself failed — the refresh token is invalid (rotated away
+          // or expired on the server). Clear local tokens so the user is
+          // prompted to re-login rather than seeing repeated 401 errors.
+          if (re.response?.statusCode == 401 || re.response?.statusCode == 403) {
+            setTokens(null);
+            onLogout?.call();
+          }
+          rethrow;
+        }
         return await fn();
       }
       rethrow;

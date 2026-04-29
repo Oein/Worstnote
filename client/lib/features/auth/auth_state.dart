@@ -98,6 +98,35 @@ class AuthController extends AsyncNotifier<AuthState> {
     ));
   }
 
+  /// Clears local auth tokens without a server call. Used when the server
+  /// reports that the refresh token is invalid — the session is already dead,
+  /// so we just need to clean up local state and prompt re-login.
+  Future<void> clearTokens() async {
+    await _storage.delete(_storeKeyTokens);
+    final cur = state.value;
+    if (cur != null) {
+      state = AsyncData(AuthState(
+        serverUrl: cur.serverUrl,
+        deviceId: cur.deviceId,
+        tokens: null,
+      ));
+    }
+  }
+
+  /// Called by external API clients when they refresh the token so the new
+  /// tokens are persisted and the auth state stays up-to-date.
+  Future<void> updateTokens(AuthTokens t) async {
+    await _persistTokens(t);
+    final cur = state.value;
+    if (cur != null) {
+      state = AsyncData(AuthState(
+        serverUrl: cur.serverUrl,
+        deviceId: cur.deviceId,
+        tokens: t,
+      ));
+    }
+  }
+
   Future<void> _persistTokens(AuthTokens? t) async {
     if (t == null) {
       await _storage.delete(_storeKeyTokens);
@@ -139,8 +168,15 @@ final authProvider =
 
 /// Convenience: build an [ApiClient] for use in sync code. Throws if the
 /// auth state isn't loaded yet.
-ApiClient apiFor(AuthState s) => ApiClient(
+///
+/// Pass [onTokens] to persist refreshed tokens back to the auth state so that
+/// rotated refresh tokens are not lost between requests.
+/// Pass [onLogout] to clear auth state when the refresh token itself is invalid
+/// (so the user is prompted to re-login instead of seeing repeated 401 errors).
+ApiClient apiFor(AuthState s, {OnTokens? onTokens, OnLogout? onLogout}) => ApiClient(
       baseUrl: s.serverUrl,
       deviceId: s.deviceId,
       tokens: s.tokens,
+      onTokens: onTokens,
+      onLogout: onLogout,
     );

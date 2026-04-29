@@ -318,10 +318,12 @@ class PageScrollerState extends State<PageScroller>
     //                  ONLY two-finger trackpad pan is allowed to scroll.
     //   - stylusOnly : stylus draws; everything else (finger, mouse drag,
     //                  trackpad) is free to scroll.
+    // In stylusOnly mode, touch panning is handled manually in _EditorScreenState
+    // so that both axes can be scrolled independently without gesture-arena
+    // axis locking.  Mouse and trackpad keep their native scroll behaviour.
     final scrollDevices =
         widget.stylusOnly
             ? <PointerDeviceKind>{
-                PointerDeviceKind.touch,
                 PointerDeviceKind.mouse,
                 PointerDeviceKind.trackpad,
               }
@@ -376,6 +378,7 @@ class PageScrollerState extends State<PageScroller>
                 page: page,
                 zoom: widget.zoom,
                 horizController: widget.horizScrollController,
+                stylusOnly: widget.stylusOnly,
                 child: widget.pageBuilder(context, page),
               );
             },
@@ -509,12 +512,16 @@ class _PageFrame extends StatefulWidget {
     required this.child,
     this.zoom = 1.0,
     this.horizController,
+    this.stylusOnly = false,
   });
 
   final NotePage page;
   final Widget child;
   final double zoom;
   final ScrollController? horizController;
+  /// When true, touch events are excluded from the horizontal scroll's
+  /// drag devices because the parent already handles them via manual 2D pan.
+  final bool stylusOnly;
 
   @override
   State<_PageFrame> createState() => _PageFrameState();
@@ -588,7 +595,7 @@ class _PageFrameState extends State<_PageFrame> {
     );
 
     return LayoutBuilder(builder: (ctx, constraints) {
-      return SingleChildScrollView(
+      final scrollView = SingleChildScrollView(
         controller: widget.horizController,
         scrollDirection: Axis.horizontal,
         physics: const ClampingScrollPhysics(),
@@ -597,6 +604,21 @@ class _PageFrameState extends State<_PageFrame> {
           child: Center(child: pageBox),
         ),
       );
+      // In stylusOnly mode touch panning is handled manually in the editor so
+      // we must prevent the horizontal SingleChildScrollView from also
+      // consuming touch events, which would cause positions to jump 2×.
+      if (widget.stylusOnly) {
+        return ScrollConfiguration(
+          behavior: ScrollConfiguration.of(ctx).copyWith(
+            dragDevices: <PointerDeviceKind>{
+              PointerDeviceKind.mouse,
+              PointerDeviceKind.trackpad,
+            },
+          ),
+          child: scrollView,
+        );
+      }
+      return scrollView;
     });
   }
 }

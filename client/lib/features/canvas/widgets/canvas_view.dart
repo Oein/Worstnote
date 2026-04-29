@@ -499,9 +499,9 @@ class _CanvasViewState extends ConsumerState<CanvasView> {
       }
     }
     if (_isStrokeAppTool(at)) {
-      // Shift + highlighter enters straight-line mode (no builder needed).
+      // Shift + highlighter OR pen enters straight-line mode (no builder needed).
       _highlighterStraightLine =
-          at == AppTool.highlighter && _shiftHeld;
+          (at == AppTool.highlighter || at == AppTool.pen) && _shiftHeld;
 
       final toolState = ref.read(toolProvider);
       // Smoothing algorithm: only applies to pen tool.
@@ -1123,7 +1123,9 @@ class _CanvasViewState extends ConsumerState<CanvasView> {
             id: newId(),
             pageId: widget.page.id,
             layerId: widget.activeLayerId,
-            tool: ToolKind.highlighter,
+            // Use the actual active tool kind so pen lines are stored as pen
+            // strokes and highlighter lines as highlighter strokes.
+            tool: at == AppTool.pen ? ToolKind.pen : ToolKind.highlighter,
             colorArgb: widget.colorArgb,
             widthPt: widget.widthPt,
             opacity: widget.opacity,
@@ -2409,25 +2411,37 @@ class _TextEditingActionBar extends StatelessWidget {
 }
 
 /// Custom cursor — a circle whose size matches the brush or eraser radius.
-/// For brush tools the disc is filled with the actual ink color/alpha so the
-/// cursor previews exactly what will be drawn. For eraser tools (no ink color)
-/// it stays a red outline ring.
+///
+/// Rendering modes:
+///   • Eraser / no fill   : red outline ring (no fill) — shows eraser area.
+///   • Brush (highlighter, tape) : filled disc in ink color + contrast edge —
+///                                 previews exact stroke appearance.
+///   • Pen (isPen = true) : crosshair + outline ring in ink color — shows the
+///                          precise drawing point AND the stroke width.  A
+///                          crosshair is used because pen draws fine lines,
+///                          not broad filled areas.
 class _BrushCursorPainter extends CustomPainter {
   _BrushCursorPainter({
     required this.center,
     required this.radius,
     this.isEraser = false,
+    this.isPen = false,
     this.fillColor,
   });
   final Offset center;
   final double radius;
   final bool isEraser;
+  /// True when the active tool is AppTool.pen — renders a crosshair cursor
+  /// that shows the stroke tip and width without obscuring the canvas.
+  final bool isPen;
   final Color? fillColor;
 
   @override
   void paint(Canvas canvas, Size size) {
     final r = radius.clamp(1.5, 600.0);
-    if (isEraser || fillColor == null) {
+
+    // ── Eraser cursor: red outline ring ──────────────────────────────────
+    if (isEraser || (!isPen && fillColor == null)) {
       canvas.drawCircle(
         center, r,
         Paint()
@@ -2438,14 +2452,64 @@ class _BrushCursorPainter extends CustomPainter {
       return;
     }
 
+    // ── Pen cursor: crosshair + outline ring in pen color ─────────────────
+    if (isPen) {
+      final color = (fillColor ?? const Color(0xFF333333)).withValues(alpha: 1.0);
+      final luminance = color.computeLuminance();
+      // Contrast halo so the cursor is visible on any background.
+      final halo = luminance > 0.55
+          ? const Color(0x88000000)
+          : const Color(0xCCFFFFFF);
+
+      // Outer ring shows stroke width.
+      final ringR = r.clamp(3.0, 600.0);
+      canvas.drawCircle(
+        center, ringR,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.0
+          ..color = halo,
+      );
+      canvas.drawCircle(
+        center, ringR,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 0.7
+          ..color = color,
+      );
+
+      // Crosshair — 6 px arms; shows the exact drawing tip.
+      const armLen = 6.0;
+      const gap = 1.5; // gap around center
+      // draw halo first (thick), then color on top (thin)
+      for (final paint in [
+        Paint()
+          ..strokeWidth = 2.5
+          ..color = halo,
+        Paint()
+          ..strokeWidth = 1.0
+          ..color = color,
+      ]) {
+        canvas.drawLine(Offset(center.dx - armLen, center.dy),
+            Offset(center.dx - gap, center.dy), paint);
+        canvas.drawLine(Offset(center.dx + gap, center.dy),
+            Offset(center.dx + armLen, center.dy), paint);
+        canvas.drawLine(Offset(center.dx, center.dy - armLen),
+            Offset(center.dx, center.dy - gap), paint);
+        canvas.drawLine(Offset(center.dx, center.dy + gap),
+            Offset(center.dx, center.dy + armLen), paint);
+      }
+      return;
+    }
+
+    // ── Brush cursor (highlighter / tape): filled disc ────────────────────
     canvas.drawCircle(
       center, r,
       Paint()
         ..style = PaintingStyle.fill
         ..color = fillColor!,
     );
-    // Contrast outline — pick dark on light fills, light on dark fills, so
-    // the cursor edge stays visible on any page background.
+    // Contrast outline — pick dark on light fills, light on dark fills.
     final luminance = fillColor!.computeLuminance();
     final outline = luminance > 0.55
         ? const Color(0x99000000)
@@ -2464,6 +2528,7 @@ class _BrushCursorPainter extends CustomPainter {
       old.center != center ||
       old.radius != radius ||
       old.isEraser != isEraser ||
+      old.isPen != isPen ||
       old.fillColor != fillColor;
 }
 
@@ -2524,6 +2589,7 @@ class _CursorOverlayState extends ConsumerState<_CursorOverlay> {
     final ts = ref.watch(toolProvider);
     final double r;
     Color? fill;
+    final isPen = !widget.isTempErasing && widget.appTool == AppTool.pen;
     if (widget.isTempErasing) {
       r = effectiveEraserRadius(ts).clamp(1.0, 80.0);
     } else {
@@ -2537,9 +2603,12 @@ class _CursorOverlayState extends ConsumerState<_CursorOverlay> {
         case AppTool.tape:
           r = (ts.tapeWidth / 2).clamp(0.5, 80.0);
           fill = Color(ts.tapeColor);
-        default:
-          r = (ts.penWidth / 2).clamp(0.5, 80.0);
-          fill = Color(ts.penColor);
+        default: // pen
+          // For pen cursor we use the ring+crosshair style (isPen=true).
+          // The ring radius uses a minimum of 4pt so it is always visible
+          // regardless of the pen width setting.
+          r = (ts.penWidth / 2).clamp(4.0, 80.0);
+          fill = Color(ts.penColor); // passed as accent color for crosshair
       }
     }
 
@@ -2554,6 +2623,7 @@ class _CursorOverlayState extends ConsumerState<_CursorOverlay> {
           isEraser: widget.isTempErasing ||
               widget.appTool == AppTool.eraserArea ||
               widget.appTool == AppTool.eraserStroke,
+          isPen: isPen,
           fillColor: fill,
         ),
         size: Size(widget.pageWidth, widget.pageHeight),

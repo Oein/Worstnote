@@ -360,7 +360,43 @@ class SyncActions {
   final Ref ref;
 
   // Tracks last server cursor per noteId for incremental pulls.
-  final Map<String, int> _pullCursors = {};
+  // Loaded from disk on first use so it survives app restarts — prevents
+  // the first push after restart from sending lastServerRev:0 and triggering
+  // false conflicts for every object on the server.
+  Map<String, int>? _pullCursors;
+
+  Future<Map<String, int>> _loadedCursors() async {
+    if (_pullCursors != null) return _pullCursors!;
+    _pullCursors = await _loadCursors();
+    return _pullCursors!;
+  }
+
+  Future<File> _cursorsFile() async {
+    final docs = await getApplicationDocumentsDirectory();
+    return File(p.join(docs.path, 'notee-sync-cursors.json'));
+  }
+
+  Future<Map<String, int>> _loadCursors() async {
+    try {
+      final f = await _cursorsFile();
+      if (!await f.exists()) return {};
+      final raw = await f.readAsString();
+      if (raw.trim().isEmpty) return {};
+      final j = jsonDecode(raw) as Map<String, dynamic>;
+      return j.map((k, v) => MapEntry(k, (v as num).toInt()));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<void> _saveCursor(String noteId, int cursor) async {
+    final cursors = await _loadedCursors();
+    cursors[noteId] = cursor;
+    try {
+      final f = await _cursorsFile();
+      await f.writeAsString(jsonEncode(cursors));
+    } catch (_) {}
+  }
 
   // Unified asset transfer queue (uploads + downloads).
   // Priority: p0 (user-requested) > p1 (current session) > p2 (background).
@@ -602,7 +638,7 @@ class SyncActions {
     if (_jobQueue.isNotEmpty && !_draining) {
       final auth = ref.read(authProvider).value;
       if (auth != null && auth.isLoggedIn) {
-        final api = apiFor(auth);
+        final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
         final notifier = ref.read(pendingAssetNotesProvider.notifier);
         // ignore: unawaited_futures
         _drainJobQueue(api: api, notifier: notifier);
@@ -624,7 +660,7 @@ class SyncActions {
     if (pending.isEmpty) return;
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return;
-    final api = apiFor(auth);
+    final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
     final repo = ref.read(repositoryProvider);
     final notifier = ref.read(pendingAssetNotesProvider.notifier);
 
@@ -842,12 +878,14 @@ class SyncActions {
       debugPrint('[Sync] syncNow: not logged in');
       throw StateError('Not logged in');
     }
-    final api = apiFor(auth);
+    final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
     final notebook = ref.read(notebookProvider);
-    final pushed = await _push(api, notebook);
-    final effectiveSince = since ?? _pullCursors[notebook.note.id] ?? 0;
+    final cursors = await _loadedCursors();
+    final lastKnownRev = cursors[notebook.note.id] ?? 0;
+    final pushed = await _push(api, notebook, lastServerRev: lastKnownRev);
+    final effectiveSince = since ?? cursors[notebook.note.id] ?? 0;
     final pulled = await _pull(api, notebook, since: effectiveSince);
-    _pullCursors[notebook.note.id] = pulled.cursor;
+    await _saveCursor(notebook.note.id, pulled.cursor);
     return SyncResult(
       pushed: pushed.pushed,
       pulled: pulled.pulled,
@@ -898,7 +936,7 @@ class SyncActions {
   Future<void> _drainTombstones() async {
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return;
-    final api = apiFor(auth);
+    final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
     final ids = await _loadTombstones();
     if (ids.isEmpty) return;
     final remaining = <String>{...ids};
@@ -922,7 +960,7 @@ class SyncActions {
   Future<void> commitNote(String noteId, {String? message}) async {
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return;
-    final api = apiFor(auth);
+    final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
     try {
       final r = await api.commitNote(noteId, message: message);
       if (r['committed'] == true) {
@@ -936,12 +974,16 @@ class SyncActions {
   Future<void> pushNote(String noteId) async {
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return;
-    final api = apiFor(auth);
+    final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
     final repo = ref.read(repositoryProvider);
     final state = await repo.loadByNoteId(noteId);
     if (state == null) return;
+    final cursors = await _loadedCursors();
     try {
-      await _push(api, state);
+      final r = await _push(api, state, lastServerRev: cursors[noteId] ?? 0);
+      if (r.serverRev > (cursors[noteId] ?? 0)) {
+        await _saveCursor(noteId, r.serverRev);
+      }
       await _enqueueUploadFiles(
         noteId: state.note.id,
         specs: state.pages.map((p) => p.spec).toList(),
@@ -958,7 +1000,7 @@ class SyncActions {
     }
   }
 
-  Future<({int pushed})> _push(ApiClient api, NotebookState s) async {
+  Future<({int pushed, int serverRev})> _push(ApiClient api, NotebookState s, {int lastServerRev = 0}) async {
     debugPrint('[Sync] _push noteId=${s.note.id} pages=${s.pages.length}');
     for (final p in s.pages) {
       debugPrint('[Sync]   page ${p.id} bg=${p.spec.background.runtimeType}');
@@ -1008,7 +1050,7 @@ class SyncActions {
       }
     }
     final body = {
-      'lastServerRev': 0,
+      'lastServerRev': lastServerRev,
       'note': {
         'id': s.note.id,
         'title': s.note.title,
@@ -1039,7 +1081,8 @@ class SyncActions {
       }
     }
 
-    return (pushed: changes.length);
+    final newServerRev = (resp['serverRev'] as num?)?.toInt() ?? lastServerRev;
+    return (pushed: changes.length, serverRev: newServerRev);
   }
 
   /// Resolves a raw specJson (Map or JSON string) to a typed Map.
@@ -1137,7 +1180,7 @@ class SyncActions {
   }) async {
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return (pushed: 0, notes: 0, pulled: 0);
-    final api = apiFor(auth);
+    final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
     final repo = ref.read(repositoryProvider);
     final pending = ref.read(pendingAssetNotesProvider.notifier);
 
@@ -1176,6 +1219,8 @@ class SyncActions {
     int notes = 0;
     int pulled = 0; // notes pulled from server
 
+    final cursors = await _loadedCursors();
+
     // ── Push local notes ──────────────────────────────────────────────
     for (final s in summaries) {
       current++;
@@ -1184,8 +1229,13 @@ class SyncActions {
       final state = await repo.loadByNoteId(s.id);
       if (state == null) continue;
       try {
-        final r = await _push(api, state);
+        final lastKnownRev = cursors[s.id] ?? 0;
+        final r = await _push(api, state, lastServerRev: lastKnownRev);
         pushed += r.pushed;
+        // Update cursor so subsequent syncs use the correct lastServerRev.
+        if (r.serverRev > lastKnownRev) {
+          await _saveCursor(s.id, r.serverRev);
+        }
         notes++;
         // Enqueue asset uploads as P1 (processed in parallel with downloads).
         await _enqueueUploadFiles(

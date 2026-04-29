@@ -13,6 +13,7 @@ import 'package:dio/dio.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
+import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -121,7 +122,7 @@ class EditorScreen extends ConsumerStatefulWidget {
 }
 
 class _EditorScreenState extends ConsumerState<EditorScreen>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   bool _showPages = false;
   int _activePageIndex = 0;
   // Scalar zoom — visual scale applied via Transform.scale (no matrix translation).
@@ -153,7 +154,21 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   /// Shared horizontal scroll controller — all page frames attach to this so
   /// they always scroll in unison. jumpTo() moves every visible page at once.
-  late final ScrollController _horizScrollController;
+  /// Custom subclass so newly-attached pages start at the current x-target
+  /// instead of 0 (fixes desync when a new page scrolls into view while zoomed).
+  late final _HorizSyncController _horizScrollController;
+
+  // ── Manual 2D pan / 2-finger zoom+pan ────────────────────────────────────
+  // Single-finger panning (stylusOnly mode) and two-finger simultaneous
+  // zoom+pan are both handled here, bypassing the gesture arena so both axes
+  // are independent (no axis-lock from nested ScrollViews).
+  int? _panPtrId;           // pointer id driving single-finger pan, or null
+  Offset _panLastPos = Offset.zero;
+  final _panHistory = <_PanSample>[];
+  late final Ticker _inertiaTicker;
+  double _inertiaVx = 0;   // content-px per frame (~60 fps)
+  double _inertiaVy = 0;
+  Offset? _pinchLastMid;   // midpoint of two fingers on previous move event
 
   /// Key into PageScrollerState so we can call scrollToPage() imperatively.
   final _scrollerKey = GlobalKey<PageScrollerState>();
@@ -172,8 +187,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   void initState() {
     super.initState();
     _scrollController = ScrollController();
-    _horizScrollController = ScrollController()
+    _horizScrollController = _HorizSyncController()
       ..addListener(_syncHorizScroll);
+    _inertiaTicker = createTicker(_onInertiaTick);
     _sidebarAnim = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 220),
@@ -213,6 +229,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       }
     }
     _horizSyncTarget = newTarget;
+    // Keep the controller's initial-offset in sync so newly-attached page
+    // frames (scrolling into view while zoomed) start at the right position.
+    _horizScrollController.setInitialOffset(newTarget);
 
     // Nothing to sync if only one page is visible.
     if (positions.length < 2) return;
@@ -362,6 +381,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     _autoSyncTimer?.cancel();
     _commitTimer?.cancel();
     HardwareKeyboard.instance.removeHandler(_hardwareKeyHandler);
+    _inertiaTicker.dispose();
     _scrollController.dispose();
     _horizScrollController.dispose();
     _sidebarAnim.dispose();
@@ -606,6 +626,109 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     }
   }
 
+  // ── Manual 2D pan helpers ─────────────────────────────────────────────────
+
+  /// Applies [dx]/[dy] (content-space pixels) to both scroll controllers.
+  /// Cancels any ongoing ballistic animation before applying so the manual
+  /// pan is not fought by a previous fling.
+  void _applyManualScrollDelta(double dx, double dy) {
+    if (_scrollController.hasClients) {
+      final pos = _scrollController.position;
+      final ny = (pos.pixels + dy).clamp(0.0, pos.maxScrollExtent);
+      if ((pos.pixels - ny).abs() > 0.1) {
+        pos.correctPixels(ny);
+        pos.notifyListeners();
+        // Keep _pendingOffset in sync so that any scheduled postFrameCallback
+        // from a prior zoom does not snap back to the stale zoom anchor.
+        _pendingOffset = ny;
+      }
+    }
+    if (_horizScrollController.hasClients && _horizScrollController.positions.isNotEmpty) {
+      for (final pos in _horizScrollController.positions) {
+        final nx = (pos.pixels + dx).clamp(0.0, pos.maxScrollExtent);
+        if ((pos.pixels - nx).abs() > 0.1) {
+          pos.correctPixels(nx);
+          pos.notifyListeners();
+        }
+      }
+      _pendingHorizOffset = _horizScrollController.positions.first.pixels;
+      _horizSyncTarget = _pendingHorizOffset;
+      _horizScrollController.setInitialOffset(_horizSyncTarget);
+    }
+  }
+
+  /// Cancels any running scroll animations so they don't fight a new manual
+  /// pan gesture.
+  void _cancelScrollAnimations() {
+    if (_scrollController.hasClients) {
+      final pos = _scrollController.position;
+      pos.jumpTo(pos.pixels);
+    }
+    if (_horizScrollController.hasClients) {
+      for (final pos in _horizScrollController.positions) {
+        pos.jumpTo(pos.pixels);
+      }
+    }
+  }
+
+  /// Ticker callback — applies decaying inertia after a pan gesture ends.
+  /// Uses friction 0.92 per frame → ~half-life of ~8 frames (≈130ms at 60fps)
+  /// for a smooth, natural-feeling glide that matches iOS scroll feel.
+  void _onInertiaTick(Duration elapsed) {
+    const friction = 0.96;
+    _inertiaVx *= friction;
+    _inertiaVy *= friction;
+    // Stop when both components are sub-pixel (content-space).
+    if (_inertiaVx.abs() < 0.1 && _inertiaVy.abs() < 0.1) {
+      _inertiaTicker.stop();
+      return;
+    }
+    _applyManualScrollDelta(_inertiaVx, _inertiaVy);
+  }
+
+  /// Estimates velocity from recent pan samples and starts the inertia ticker.
+  ///
+  /// Velocity is computed in content-space px/frame so [_applyManualScrollDelta]
+  /// receives the right units: screen-px/s ÷ zoom ÷ 60fps.
+  void _startPanInertia() {
+    if (_panHistory.length < 2) {
+      _panHistory.clear();
+      return;
+    }
+    final now = DateTime.now();
+    // Use last 100ms window — short enough to capture lift-off direction,
+    // long enough to smooth single-frame jitter.
+    final cutoff = now.subtract(const Duration(milliseconds: 100));
+    final recent = _panHistory.where((s) => s.t.isAfter(cutoff)).toList();
+    _panHistory.clear();
+
+    if (recent.length < 2) {
+      _inertiaTicker.stop();
+      return;
+    }
+    final first = recent.first;
+    final last = recent.last;
+    final dt = last.t.difference(first.t).inMicroseconds / 1e6;
+    if (dt < 0.001) return;
+
+    final dp = last.p - first.p;
+    // screen-px/s → content-px/frame:
+    //   1. dp/dt          = screen-px/s (finger velocity)
+    //   2. / 60           = screen-px/frame (at 60 fps)
+    //   3. / _zoom        = content-px/frame (content-space for scroll controller)
+    // Negated because drag-down should scroll down (positive offset increase
+    // in the scroll controller corresponds to negative finger delta).
+    // Cap at 200 content-px/frame — high enough that fast flicks feel
+    // proportionally faster while still preventing runaway on accidental jerks.
+    const capV = 600.0;
+    final zoom = _zoom.clamp(0.1, 10.0);
+    _inertiaVx = -(dp.dx / dt / 60 / zoom).clamp(-capV, capV);
+    _inertiaVy = -(dp.dy / dt / 60 / zoom).clamp(-capV, capV);
+
+    _inertiaTicker.stop();
+    _inertiaTicker.start();
+  }
+
   Future<void> _onPullToAddTemplate() async {
     final state = ref.read(notebookProvider);
     if (state.pages.isEmpty) return;
@@ -682,41 +805,121 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   onPointerPanZoomEnd: (_) {
                     _lastPinchScale = 1.0;
                   },
-                  // Android touch: track positions for pinch-to-zoom.
+                  // Android touch: track positions for pinch-to-zoom and for
+                  // manual 2D panning.
+                  //
+                  // Gesture mapping (both pen and stylus-only modes):
+                  //   1 touch (stylusOnly)  → 2D manual pan
+                  //   2 touch               → simultaneous zoom + pan
+                  //   1/2 touch (pen mode)  → 2 touch still zoom + pan;
+                  //                           1 touch handled by CanvasView (drawing)
                   onPointerDown: (e) {
                     if (e.kind != PointerDeviceKind.touch) return;
                     _touchPositions[e.pointer] = e.localPosition;
-                    // Rebuild so isPinching flag propagates to CanvasView.
-                    if (_touchPositions.length == 2) setState(() {});
+                    if (_touchPositions.length >= 2) {
+                      // Entering 2-finger mode — cancel single-finger pan.
+                      _panPtrId = null;
+                      _inertiaTicker.stop();
+                      _panHistory.clear();
+                      // Store midpoint baseline for translation tracking.
+                      final ids = _touchPositions.keys.toList();
+                      _pinchLastMid = (_touchPositions[ids[0]]! +
+                              _touchPositions[ids[1]]!) /
+                          2;
+                      // Rebuild so isPinching flag propagates to CanvasView.
+                      setState(() {});
+                    } else if (_touchPositions.length == 1) {
+                      // First finger down — start single-finger pan tracking.
+                      _panPtrId = e.pointer;
+                      _panLastPos = e.localPosition;
+                      _panHistory.clear();
+                      _panHistory.add(_PanSample(DateTime.now(), e.localPosition));
+                      _inertiaTicker.stop();
+                      _cancelScrollAnimations();
+                    }
                   },
                   onPointerMove: (e) {
                     if (e.kind != PointerDeviceKind.touch) return;
                     if (!_touchPositions.containsKey(e.pointer)) return;
                     if (_touchPositions.length == 2) {
+                      // ── 2-finger: zoom + pan simultaneously ─────────────
                       final otherId = _touchPositions.keys
                           .firstWhere((id) => id != e.pointer);
-                      final oldDist = (_touchPositions[e.pointer]! -
-                              _touchPositions[otherId]!)
-                          .distance;
+                      final otherPos = _touchPositions[otherId]!;
+                      final oldMid =
+                          (_touchPositions[e.pointer]! + otherPos) / 2;
+                      final oldDist =
+                          (_touchPositions[e.pointer]! - otherPos).distance;
                       _touchPositions[e.pointer] = e.localPosition;
-                      final newDist = (_touchPositions[e.pointer]! -
-                              _touchPositions[otherId]!)
-                          .distance;
-                      if (oldDist > 0 && (newDist / oldDist - 1.0).abs() > 0.005) {
-                        _zoomAround(e.localPosition, newDist / oldDist);
+                      final newMid = (e.localPosition + otherPos) / 2;
+                      final newDist = (e.localPosition - otherPos).distance;
+
+                      // Zoom around the new midpoint.
+                      if (oldDist > 0 &&
+                          (newDist / oldDist - 1.0).abs() > 0.005) {
+                        _zoomAround(newMid, newDist / oldDist);
+                      }
+
+                      // Pan: midpoint delta in screen-px → content-px via /zoom.
+                      final midDelta = newMid - (_pinchLastMid ?? oldMid);
+                      _pinchLastMid = newMid;
+                      if (midDelta.distance > 0.5) {
+                        _applyManualScrollDelta(
+                            -midDelta.dx / _zoom, -midDelta.dy / _zoom);
                       }
                     } else {
+                      // ── Single finger ───────────────────────────────────
                       _touchPositions[e.pointer] = e.localPosition;
+                      final isStylusOnly = ref.read(toolProvider).inputDrawMode ==
+                          InputDrawMode.stylusOnly;
+                      if (isStylusOnly && e.pointer == _panPtrId) {
+                        // Manual 2D pan: screen-px delta → content-px via /zoom.
+                        final delta = e.localPosition - _panLastPos;
+                        _panLastPos = e.localPosition;
+                        _panHistory.add(_PanSample(DateTime.now(), e.localPosition));
+                        if (_panHistory.length > 30) _panHistory.removeAt(0);
+                        _applyManualScrollDelta(
+                            -delta.dx / _zoom, -delta.dy / _zoom);
+                      }
                     }
                   },
                   onPointerUp: (e) {
                     if (e.kind != PointerDeviceKind.touch) return;
                     _touchPositions.remove(e.pointer);
+                    if (e.pointer == _panPtrId) {
+                      _panPtrId = null;
+                      _startPanInertia();
+                    }
+                    // Transitioning 2→1 finger: resume single-finger pan if
+                    // the remaining finger is a touch (stylusOnly mode).
+                    if (_touchPositions.length == 1) {
+                      _pinchLastMid = null;
+                      final isStylusOnly =
+                          ref.read(toolProvider).inputDrawMode ==
+                              InputDrawMode.stylusOnly;
+                      if (isStylusOnly) {
+                        final remainId = _touchPositions.keys.first;
+                        _panPtrId = remainId;
+                        _panLastPos = _touchPositions[remainId]!;
+                        _panHistory.clear();
+                        _panHistory.add(
+                            _PanSample(DateTime.now(), _panLastPos));
+                        _inertiaTicker.stop();
+                      }
+                    } else if (_touchPositions.isEmpty) {
+                      _pinchLastMid = null;
+                    }
                     setState(() {});
                   },
                   onPointerCancel: (e) {
                     if (e.kind != PointerDeviceKind.touch) return;
                     _touchPositions.remove(e.pointer);
+                    if (e.pointer == _panPtrId) {
+                      _panPtrId = null;
+                      _panHistory.clear();
+                      _inertiaTicker.stop();
+                    }
+                    if (_touchPositions.length < 2) _pinchLastMid = null;
                     setState(() {});
                   },
                   child: Stack(children: [
@@ -861,6 +1064,29 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       ),
     );
   }
+}
+
+// ── Pan sample — lightweight record for velocity estimation ──────────────────
+class _PanSample {
+  const _PanSample(this.t, this.p);
+  final DateTime t;
+  final Offset p;
+}
+
+// ── _HorizSyncController ─────────────────────────────────────────────────────
+// ScrollController subclass that stores an initial offset so that newly-
+// attached page frames (which appear when the user y-scrolls to a new page
+// while zoomed with a horizontal x-offset) start at the right position
+// instead of 0.
+class _HorizSyncController extends ScrollController {
+  _HorizSyncController() : super(keepScrollOffset: false);
+
+  double _initialOffset = 0;
+
+  void setInitialOffset(double v) => _initialOffset = v;
+
+  @override
+  double get initialScrollOffset => _initialOffset;
 }
 
 // ── Top bar (back · pages-toggle · breadcrumb · title · page counter ·

@@ -217,9 +217,33 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
     final ctl = ref.read(libraryProvider.notifier);
     final wide = MediaQuery.sizeOf(context).width >= 720;
 
+    // Sidebar widget factory — used both in the inline rail (wide) and in
+    // the Drawer (compact).  When used inside the Drawer the onFilterChanged
+    // callback also pops the route so the drawer closes automatically.
+    Widget buildSidebar({required bool inDrawer}) => _Sidebar(
+      state: widget.state,
+      filter: _filter,
+      onFilterChanged: (f) {
+        setState(() => _filter = f);
+        if (f == _LibFilter.all) {
+          ref.read(libraryProvider.notifier).navigateRoot();
+        }
+        if (inDrawer) Navigator.of(context).pop();
+      },
+    );
+
     final hasStatusBar = MediaQuery.viewPaddingOf(context).top > 0;
     return Scaffold(
       backgroundColor: t.bg,
+      // Compact (< 720 px): sidebar is a Drawer that slides in from the left.
+      // The hamburger button in _TopBar opens it; tapping the backdrop closes it.
+      drawer: wide
+          ? null
+          : Drawer(
+              width: 260,
+              backgroundColor: t.toolbar,
+              child: SafeArea(child: buildSidebar(inDrawer: true)),
+            ),
       body: SafeArea(
         bottom: false,
         top: hasStatusBar,
@@ -227,6 +251,7 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _TopBar(
+            showMenuButton: !wide,
             isGridView: _isGridView,
             sortOrder: _sortOrder,
             onSearch: (v) => setState(() => _searchQuery = v),
@@ -240,16 +265,7 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
                 if (wide)
                   SizedBox(
                     width: 220,
-                    child: _Sidebar(
-                      state: widget.state,
-                      filter: _filter,
-                      onFilterChanged: (f) {
-                        setState(() => _filter = f);
-                        if (f == _LibFilter.all) {
-                          ref.read(libraryProvider.notifier).navigateRoot();
-                        }
-                      },
-                    ),
+                    child: buildSidebar(inDrawer: false),
                   ),
                 if (wide)
                   Container(width: 0.5, color: t.tbBorder),
@@ -281,12 +297,14 @@ class _LibraryViewState extends ConsumerState<_LibraryView> {
 // ── Top bar ─────────────────────────────────────────────────────────────
 class _TopBar extends ConsumerStatefulWidget {
   const _TopBar({
+    required this.showMenuButton,
     required this.isGridView,
     required this.sortOrder,
     required this.onSearch,
     required this.onToggleView,
     required this.onSortChanged,
   });
+  final bool showMenuButton;
   final bool isGridView;
   final _SortOrder sortOrder;
   final void Function(String) onSearch;
@@ -301,6 +319,20 @@ class _TopBarState extends ConsumerState<_TopBar> {
   final _newBtnKey = GlobalKey();
   final _viewMenuKey = GlobalKey();
   final _cloudBtnKey = GlobalKey();
+  bool _searchExpanded = false;
+  final _searchFocusNode = FocusNode();
+
+  @override
+  void dispose() {
+    _searchFocusNode.dispose();
+    super.dispose();
+  }
+
+  bool _hideLogo(BuildContext context) {
+    if (!widget.showMenuButton) return false;
+    if (_searchExpanded) return true;
+    return MediaQuery.of(context).size.width < 380;
+  }
 
   Future<void> _openNewItemMenu() async {
     final result = await showNoteeMenu<_LibAction>(
@@ -493,58 +525,114 @@ class _TopBarState extends ConsumerState<_TopBar> {
       ),
       padding: const EdgeInsets.symmetric(horizontal: 18),
       child: Row(children: [
-        // Notee logo: rounded-square with three pen scratches.
-        Container(
-          width: 24,
-          height: 24,
-          decoration: BoxDecoration(
-            color: t.ink,
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: CustomPaint(painter: _LogoStrokes(t.page)),
-        ),
-        const SizedBox(width: 8),
-        Text('Worstnote', style: Theme.of(context).textTheme.titleLarge),
-        // Search field centred; buttons stay flush right.
-        Expanded(
-          child: Center(
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 360),
-              child: _SearchField(onChanged: widget.onSearch),
+        // Compact mode: hamburger button opens the sidebar drawer.
+        if (widget.showMenuButton) ...[
+          Builder(
+            builder: (ctx) => IconButton(
+              icon: Icon(Icons.menu_rounded, size: 20, color: t.inkDim),
+              tooltip: '메뉴',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+              onPressed: () => Scaffold.of(ctx).openDrawer(),
             ),
           ),
-        ),
-        const SizedBox(width: 4),
-        // Cloud sync status button.
-        KeyedSubtree(
-          key: _cloudBtnKey,
-          child: _CloudButton(
-            anchorKey: _cloudBtnKey,
-          ),
-        ),
-        const SizedBox(width: 4),
-        // View/sort menu button.
-        KeyedSubtree(
-          key: _viewMenuKey,
-          child: IconButton(
-            tooltip: '보기 및 정렬',
-            icon: NoteeIconWidget(
-              widget.isGridView ? NoteeIcon.grid : NoteeIcon.rows,
-              size: 17,
-              color: t.inkDim,
+          const SizedBox(width: 4),
+        ],
+        // Notee logo: hidden when search is expanded OR screen is too narrow.
+        if (!_hideLogo(context)) ...[
+          Container(
+            width: 24,
+            height: 24,
+            decoration: BoxDecoration(
+              color: t.ink,
+              borderRadius: BorderRadius.circular(6),
             ),
-            onPressed: _openViewMenu,
+            child: CustomPaint(painter: _LogoStrokes(t.page)),
           ),
-        ),
-        const SizedBox(width: 8),
-        KeyedSubtree(
-          key: _newBtnKey,
-          child: FilledButton.icon(
-            icon: const NoteeIconWidget(NoteeIcon.plus, size: 14, color: Colors.white),
-            label: const Text('새 항목'),
-            onPressed: _openNewItemMenu,
+          const SizedBox(width: 8),
+          Text('Worstnote', style: Theme.of(context).textTheme.titleLarge),
+        ],
+        // Search field: compact mode shows icon → expands to fill full bar.
+        if (widget.showMenuButton && _searchExpanded) ...[
+          // Search expanded: show only the search field + close button.
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              child: _SearchField(
+                focusNode: _searchFocusNode,
+                onChanged: widget.onSearch,
+                onClose: () {
+                  setState(() => _searchExpanded = false);
+                  widget.onSearch('');
+                },
+              ),
+            ),
           ),
-        ),
+        ] else ...[
+          // Normal state: logo already shown above; search icon + right buttons.
+          if (widget.showMenuButton)
+            IconButton(
+              icon: NoteeIconWidget(NoteeIcon.search, size: 17, color: t.inkDim),
+              tooltip: '검색',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              onPressed: () {
+                setState(() => _searchExpanded = true);
+                Future.delayed(const Duration(milliseconds: 50), () {
+                  if (mounted) _searchFocusNode.requestFocus();
+                });
+              },
+            )
+          else
+            Expanded(
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 360),
+                  child: _SearchField(onChanged: widget.onSearch),
+                ),
+              ),
+            ),
+          if (widget.showMenuButton) const Spacer(),
+          const SizedBox(width: 4),
+          // Cloud sync status button.
+          KeyedSubtree(
+            key: _cloudBtnKey,
+            child: _CloudButton(anchorKey: _cloudBtnKey),
+          ),
+          const SizedBox(width: 4),
+          // View/sort menu button.
+          KeyedSubtree(
+            key: _viewMenuKey,
+            child: IconButton(
+              tooltip: '보기 및 정렬',
+              icon: NoteeIconWidget(
+                widget.isGridView ? NoteeIcon.grid : NoteeIcon.rows,
+                size: 17,
+                color: t.inkDim,
+              ),
+              onPressed: _openViewMenu,
+            ),
+          ),
+          const SizedBox(width: 8),
+          KeyedSubtree(
+            key: _newBtnKey,
+            child: widget.showMenuButton
+                ? IconButton(
+                    icon: const NoteeIconWidget(NoteeIcon.plus, size: 17, color: Colors.white),
+                    style: IconButton.styleFrom(
+                      backgroundColor: const Color(0xFF2563EB),
+                      padding: const EdgeInsets.all(8),
+                      minimumSize: const Size(36, 36),
+                    ),
+                    onPressed: _openNewItemMenu,
+                  )
+                : FilledButton.icon(
+                    icon: const NoteeIconWidget(NoteeIcon.plus, size: 14, color: Colors.white),
+                    label: const Text('새 항목'),
+                    onPressed: _openNewItemMenu,
+                  ),
+          ),
+        ],
       ]),
     );
   }
@@ -571,8 +659,16 @@ class _LogoStrokes extends CustomPainter {
 }
 
 class _SearchField extends StatelessWidget {
-  const _SearchField({required this.onChanged});
+  const _SearchField({
+    super.key,
+    required this.onChanged,
+    this.focusNode,
+    this.onClose,
+  });
   final void Function(String) onChanged;
+  final FocusNode? focusNode;
+  final VoidCallback? onClose;
+
   @override
   Widget build(BuildContext context) {
     final t = NoteeProvider.of(context).tokens;
@@ -589,16 +685,24 @@ class _SearchField extends StatelessWidget {
         const SizedBox(width: 8),
         Expanded(
           child: TextField(
+            focusNode: focusNode,
             onChanged: onChanged,
             style: TextStyle(fontSize: 12.5, color: t.ink),
             decoration: InputDecoration(
               isDense: true,
               border: InputBorder.none,
-              hintText: 'Search across all notebooks…',
+              hintText: 'Search…',
               hintStyle: TextStyle(fontSize: 12.5, color: t.inkDim),
             ),
           ),
         ),
+        if (onClose != null) ...[
+          const SizedBox(width: 4),
+          GestureDetector(
+            onTap: onClose,
+            child: Icon(Icons.close_rounded, size: 16, color: t.inkDim),
+          ),
+        ],
       ]),
     );
   }
@@ -1377,7 +1481,7 @@ class _ConflictResolutionDialogState
   Future<void> _load() async {
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return;
-    final api = apiFor(auth);
+    final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
     try {
       final data = await api.conflictGet(widget.noteId, widget.sessionId);
       if (!mounted) return;
@@ -1402,7 +1506,7 @@ class _ConflictResolutionDialogState
   Future<void> _apply() async {
     final auth = ref.read(authProvider).value;
     if (auth == null || !auth.isLoggedIn) return;
-    final api = apiFor(auth);
+    final api = apiFor(auth, onTokens: (t) { ref.read(authProvider.notifier).updateTokens(t); }, onLogout: () { ref.read(authProvider.notifier).clearTokens(); });
     setState(() => _applying = true);
     try {
       await api.conflictResolve(widget.noteId, widget.sessionId, [
@@ -1717,6 +1821,8 @@ class _SyncQueueDialogState extends ConsumerState<_SyncQueueDialog> {
                         color: t.inkFaint)),
               ]),
               const SizedBox(height: 12),
+              const _SyncProgressStrip(),
+              const SizedBox(height: 8),
               Expanded(
                 child: ListView(
                   shrinkWrap: true,
@@ -2432,15 +2538,26 @@ class _MainAreaState extends ConsumerState<_MainArea> {
     if (filter != _LibFilter.recent) notes = _sorted(notes);
 
     // fromLTRB(28,20,28,0) — the scroll view handles bottom inset itself.
-    return Padding(
+    final isInFolder = state.currentFolderId != null;
+    return PopScope(
+      // Block default back when in selection mode or inside a subfolder.
+      canPop: !_selectionMode && !isInFolder,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        if (_selectionMode) {
+          _exitSelectionMode();
+        } else if (isInFolder) {
+          ctl.navigateUp();
+        }
+      },
+      child: Stack(children: [
+        Padding(
       padding: const EdgeInsets.fromLTRB(28, 20, 28, 0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _Breadcrumb(state: state),
           const SizedBox(height: 8),
-          // Thin sync progress bar — only visible while sync is active.
-          const _SyncProgressStrip(),
           // Conflict banner — only visible if any push hit a server-side
           // conflict that still needs the user's resolution.
           const _ConflictBanner(),
@@ -2453,95 +2570,6 @@ class _MainAreaState extends ConsumerState<_MainArea> {
               totalVisible: folders.length + notes.length,
               onClear: _exitSelectionMode,
               onSelectAll: () => _selectAllVisible(folders, notes),
-              onDelete: _selectedIds.isEmpty ? null : () async {
-                final total = _selectedIds.length;
-                final ok = await noteeConfirm(context,
-                    title: '$total개 항목 삭제',
-                    body: '선택한 항목이 모두 삭제됩니다.');
-                if (!context.mounted) return;
-                if (ok) {
-                  if (_selectedFolderIds.isNotEmpty) {
-                    for (final id in _selectedFolderIds) {
-                      await ctl.deleteFolder(id);
-                    }
-                  }
-                  if (_selectedNoteIds.isNotEmpty) {
-                    await ctl.bulkDelete(_selectedNoteIds);
-                  }
-                  _exitSelectionMode();
-                }
-              },
-              onMove: _selectedIds.isEmpty ? null : () async {
-                // When moving folders: exclude self + descendants from picker.
-                final lib = ref.read(libraryProvider).value;
-                final excludeIds = <String>{};
-                if (lib != null) {
-                  for (final id in _selectedFolderIds) {
-                    excludeIds.addAll(_allDescendantFolderIds(lib.folders, id));
-                  }
-                }
-                if (!context.mounted) return;
-                final folderId = await _pickFolder(context, ref,
-                    excludeFolderIds: excludeIds);
-                if (folderId != null && context.mounted) {
-                  final target = folderId == '__root__' ? null : folderId;
-                  await ctl.bulkMoveItems(_selectedNoteIds, _selectedFolderIds, target);
-                  _exitSelectionMode();
-                }
-              },
-              onDuplicate: (_selectedFolderIds.isEmpty && _selectedNoteIds.isNotEmpty)
-                  ? () async {
-                      await ctl.bulkDuplicate(_selectedNoteIds);
-                      _exitSelectionMode();
-                    }
-                  : null,
-              // Single-item extras
-              singleFolder: _selectedFolderIds.length == 1 && _selectedNoteIds.isEmpty
-                  ? folders.where((f) => f.id == _selectedFolderIds.first).cast<Folder?>().firstOrNull
-                  : null,
-              singleNote: _selectedNoteIds.length == 1 && _selectedFolderIds.isEmpty
-                  ? notes.where((n) => n.id == _selectedNoteIds.first).cast<NoteSummary?>().firstOrNull
-                  : null,
-              onSingleFolderRename: (f) async {
-                final name = await noteeAskName(context,
-                    title: '폴더 이름 수정', initial: f.name, confirmLabel: '저장');
-                if (name != null && name.trim().isNotEmpty) {
-                  await ctl.renameFolder(f.id, name.trim());
-                }
-                if (mounted) _exitSelectionMode();
-              },
-              onSingleFolderAppearance: (f) async {
-                if (!context.mounted) return;
-                final r = await showDialog<(int, String)>(
-                  context: context,
-                  builder: (_) => _FolderAppearanceDialog(
-                    initialColor: f.colorArgb, initialIconKey: f.iconKey),
-                );
-                if (r != null) await ctl.updateFolderAppearance(f.id, r.$1, r.$2);
-              },
-              onSingleNoteRename: (n) async {
-                final name = await noteeAskName(context,
-                    title: '노트 이름 수정', initial: n.title, confirmLabel: '저장');
-                if (name != null && name.trim().isNotEmpty) {
-                  await ctl.renameNotebook(n.id, name.trim());
-                }
-                if (mounted) _exitSelectionMode();
-              },
-              onSingleNoteFavorite: (n) => ctl.toggleFavorite(n.id),
-              onSingleNoteExport: (n) async {
-                if (!context.mounted) return;
-                final repo = ref.read(repositoryProvider);
-                final nbState = await repo.loadByNoteId(n.id);
-                if (nbState == null || !context.mounted) return;
-                final path = await ExportDialog.show(context, nbState,
-                    suggestedName: n.title);
-                if (path != null && context.mounted) {
-                  ScaffoldMessenger.of(context)
-                    ..clearSnackBars()
-                    ..showSnackBar(SnackBar(content: Text('저장됨: $path'),
-                        duration: const Duration(seconds: 4)));
-                }
-              },
             )
           else
             Row(crossAxisAlignment: CrossAxisAlignment.baseline,
@@ -2647,6 +2675,111 @@ class _MainAreaState extends ConsumerState<_MainArea> {
           ),
         ],
       ),
+        ),
+        if (_selectionMode && _selectedIds.isNotEmpty)
+          _SelectionActionPanel(
+            noteCount: _selectedNoteIds.length,
+            folderCount: _selectedFolderIds.length,
+            singleNote: _selectedNoteIds.length == 1 && _selectedFolderIds.isEmpty
+                ? notes.where((n) => n.id == _selectedNoteIds.first).cast<NoteSummary?>().firstOrNull
+                : null,
+            singleFolder: _selectedFolderIds.length == 1 && _selectedNoteIds.isEmpty
+                ? folders.where((f) => f.id == _selectedFolderIds.first).cast<Folder?>().firstOrNull
+                : null,
+            onMove: _selectedIds.isEmpty ? null : () async {
+              final lib = ref.read(libraryProvider).value;
+              final excludeIds = <String>{};
+              if (lib != null) {
+                for (final id in _selectedFolderIds) {
+                  excludeIds.addAll(_allDescendantFolderIds(lib.folders, id));
+                }
+              }
+              if (!context.mounted) return;
+              final folderId = await _pickFolder(context, ref, excludeFolderIds: excludeIds);
+              if (folderId != null && context.mounted) {
+                final target = folderId == '__root__' ? null : folderId;
+                await ctl.bulkMoveItems(_selectedNoteIds, _selectedFolderIds, target);
+              }
+              _exitSelectionMode();
+            },
+            onDelete: _selectedIds.isEmpty ? null : () async {
+              final total = _selectedIds.length;
+              final ok = await noteeConfirm(context,
+                  title: '$total개 항목 삭제',
+                  body: '선택한 항목이 모두 삭제됩니다.');
+              if (!context.mounted) return;
+              if (ok) {
+                if (_selectedFolderIds.isNotEmpty) {
+                  for (final id in _selectedFolderIds) {
+                    await ctl.deleteFolder(id);
+                  }
+                }
+                if (_selectedNoteIds.isNotEmpty) {
+                  await ctl.bulkDelete(_selectedNoteIds);
+                }
+                _exitSelectionMode();
+              }
+            },
+            onDuplicate: (_selectedFolderIds.isEmpty && _selectedNoteIds.isNotEmpty) ? () async {
+              await ctl.bulkDuplicate(_selectedNoteIds);
+              _exitSelectionMode();
+            } : null,
+            onRenameNote: (_selectedNoteIds.length == 1 && _selectedFolderIds.isEmpty)
+                ? () async {
+                    final n = notes.where((n) => n.id == _selectedNoteIds.first).cast<NoteSummary?>().firstOrNull;
+                    if (n == null) return;
+                    final name = await noteeAskName(context, title: '노트 이름 수정', initial: n.title, confirmLabel: '저장');
+                    if (name != null && name.trim().isNotEmpty) {
+                      await ctl.renameNotebook(n.id, name.trim());
+                    }
+                    _exitSelectionMode();
+                  }
+                : null,
+            onFavoriteNote: (_selectedNoteIds.length == 1 && _selectedFolderIds.isEmpty)
+                ? () async {
+                    final n = notes.where((n) => n.id == _selectedNoteIds.first).cast<NoteSummary?>().firstOrNull;
+                    if (n == null) return;
+                    await ctl.toggleFavorite(n.id);
+                    _exitSelectionMode();
+                  }
+                : null,
+            onExportNote: (_selectedNoteIds.length == 1 && _selectedFolderIds.isEmpty)
+                ? () async {
+                    final n = notes.where((n) => n.id == _selectedNoteIds.first).cast<NoteSummary?>().firstOrNull;
+                    if (n == null || !context.mounted) return;
+                    await _executeNoteAction(context, ref, n, _NoteCtx.export);
+                    _exitSelectionMode();
+                  }
+                : null,
+            onHistoryNote: (_selectedNoteIds.length == 1 && _selectedFolderIds.isEmpty)
+                ? () async {
+                    final n = notes.where((n) => n.id == _selectedNoteIds.first).cast<NoteSummary?>().firstOrNull;
+                    if (n == null || !context.mounted) return;
+                    await _executeNoteAction(context, ref, n, _NoteCtx.history);
+                    _exitSelectionMode();
+                  }
+                : null,
+            onRenameFolder: (_selectedFolderIds.length == 1 && _selectedNoteIds.isEmpty)
+                ? () async {
+                    final f = folders.where((f) => f.id == _selectedFolderIds.first).cast<Folder?>().firstOrNull;
+                    if (f == null) return;
+                    final name = await noteeAskName(context, title: '폴더 이름 수정', initial: f.name, confirmLabel: '저장');
+                    if (name != null && name.trim().isNotEmpty) {
+                      await ctl.renameFolder(f.id, name.trim());
+                    }
+                    _exitSelectionMode();
+                  }
+                : null,
+            onAppearanceFolder: (_selectedFolderIds.length == 1 && _selectedNoteIds.isEmpty)
+                ? () async {
+                    final f = folders.where((f) => f.id == _selectedFolderIds.first).cast<Folder?>().firstOrNull;
+                    if (f == null || !context.mounted) return;
+                    await _showFolderContextMenu(context, ref, f, Offset.zero);
+                    _exitSelectionMode();
+                  }
+                : null,
+          ),
+      ]),
     );
   }
 }
@@ -2765,50 +2898,75 @@ class _GridContentState extends State<_GridContent> {
     // Keep only keys for current items
     _itemKeys.removeWhere((id, _) => !allItems.contains(id));
 
-    final grid = GridView(
-      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 200,
-        mainAxisExtent: 300,
-        crossAxisSpacing: 28,
-        mainAxisSpacing: 28,
-      ),
-      padding: const EdgeInsets.only(top: 8, bottom: 72),
-      children: [
-        for (final f in widget.folders)
-          _SelectableWrapper(
-            key: _itemKeys[f.id],
-            id: f.id,
-            selected: widget.selectedFolderIds.contains(f.id),
-            onToggleSelect: widget.onToggleSelectFolder,
-            onEnterSelection: widget.onEnterSelectionFolder,
-            child: _FolderTile(
-              folder: f,
-              onOpen: () => widget.onOpenFolder(f.id),
-              onLongPress: null, // handled by _SelectableWrapper
-              onContextMenu: widget.onFolderContext == null
-                  ? null
-                  : (pos) => widget.onFolderContext!(f, pos),
-            ),
-          ),
-        for (final n in widget.notes)
-          _SelectableWrapper(
-            key: _itemKeys[n.id],
-            id: n.id,
-            selected: widget.selectedNoteIds.contains(n.id),
-            onToggleSelect: widget.onToggleSelectNote,
-            onEnterSelection: widget.onEnterSelectionNote,
-            child: _SyncingOverlay(
-              syncing: widget.pendingNoteIds.contains(n.id),
-              child: _NotebookCover(
-                note: n,
-                onTap: () => widget.onOpenNote(n.id),
-                onLongPress: null, // handled by _SelectableWrapper
-                onContextMenu: widget.onNoteContext == null
-                    ? null
-                    : (pos) => widget.onNoteContext!(n, pos),
+    // Folders and notes use different tile heights: folders are compact
+    // (icon + name), notes are portrait (cover + title).
+    final grid = CustomScrollView(
+      slivers: [
+        if (widget.folders.isNotEmpty)
+          SliverPadding(
+            padding: const EdgeInsets.only(top: 8),
+            sliver: SliverGrid(
+              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                maxCrossAxisExtent: 120,
+                mainAxisExtent: 120,
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
               ),
+              delegate: SliverChildListDelegate([
+                for (final f in widget.folders)
+                  _SelectableWrapper(
+                    key: _itemKeys[f.id],
+                    id: f.id,
+                    selected: widget.selectedFolderIds.contains(f.id),
+                    onToggleSelect: widget.onToggleSelectFolder,
+                    onEnterSelection: widget.onEnterSelectionFolder,
+                    child: _FolderTile(
+                      folder: f,
+                      onOpen: () => widget.onOpenFolder(f.id),
+                      onLongPress: null,
+                      onContextMenu: widget.onFolderContext == null
+                          ? null
+                          : (pos) => widget.onFolderContext!(f, pos),
+                    ),
+                  ),
+              ]),
             ),
           ),
+        SliverPadding(
+          padding: EdgeInsets.only(
+            top: widget.folders.isNotEmpty ? 20 : 8,
+            bottom: 72,
+          ),
+          sliver: SliverGrid(
+            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+              maxCrossAxisExtent: 200,
+              mainAxisExtent: 300,
+              crossAxisSpacing: 28,
+              mainAxisSpacing: 28,
+            ),
+            delegate: SliverChildListDelegate([
+              for (final n in widget.notes)
+                _SelectableWrapper(
+                  key: _itemKeys[n.id],
+                  id: n.id,
+                  selected: widget.selectedNoteIds.contains(n.id),
+                  onToggleSelect: widget.onToggleSelectNote,
+                  onEnterSelection: widget.onEnterSelectionNote,
+                  child: _SyncingOverlay(
+                    syncing: widget.pendingNoteIds.contains(n.id),
+                    child: _NotebookCover(
+                      note: n,
+                      onTap: () => widget.onOpenNote(n.id),
+                      onLongPress: null,
+                      onContextMenu: widget.onNoteContext == null
+                          ? null
+                          : (pos) => widget.onNoteContext!(n, pos),
+                    ),
+                  ),
+                ),
+            ]),
+          ),
+        ),
       ],
     );
 
@@ -3118,8 +3276,9 @@ class _ListDivider extends StatelessWidget {
   }
 }
 
-/// Wraps a tile with long-press → selection mode, Cmd/Shift+click selection,
-/// and a blue selection overlay when selected.
+/// Wraps a tile with long-press → action menu (mobile) or selection mode
+/// (desktop), Cmd/Shift+click selection, and a blue selection overlay when
+/// selected.
 class _SelectableWrapper extends StatelessWidget {
   const _SelectableWrapper({
     super.key,
@@ -3186,24 +3345,16 @@ class _SelectableWrapper extends StatelessWidget {
   }
 }
 
-/// Toolbar shown above the content when items are selected.
+/// Thin selection-mode strip shown at the top of the content area.
+/// Actions have been moved to [_SelectionActionPanel] (floating bottom-right).
 class _MultiSelectBar extends StatelessWidget {
   const _MultiSelectBar({
+    super.key,
     required this.noteCount,
     required this.folderCount,
     required this.totalVisible,
     required this.onClear,
     required this.onSelectAll,
-    required this.onDelete,
-    required this.onMove,
-    this.onDuplicate,
-    this.singleFolder,
-    this.singleNote,
-    this.onSingleFolderRename,
-    this.onSingleFolderAppearance,
-    this.onSingleNoteRename,
-    this.onSingleNoteFavorite,
-    this.onSingleNoteExport,
   });
 
   final int noteCount;
@@ -3211,17 +3362,6 @@ class _MultiSelectBar extends StatelessWidget {
   final int totalVisible;
   final VoidCallback onClear;
   final VoidCallback onSelectAll;
-  final VoidCallback? onDelete;
-  final VoidCallback? onMove;
-  final VoidCallback? onDuplicate;
-  // Single-item extras
-  final Folder? singleFolder;
-  final NoteSummary? singleNote;
-  final void Function(Folder)? onSingleFolderRename;
-  final void Function(Folder)? onSingleFolderAppearance;
-  final void Function(NoteSummary)? onSingleNoteRename;
-  final void Function(NoteSummary)? onSingleNoteFavorite;
-  final void Function(NoteSummary)? onSingleNoteExport;
 
   int get _count => noteCount + folderCount;
 
@@ -3229,109 +3369,45 @@ class _MultiSelectBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = NoteeProvider.of(context).tokens;
     final allSelected = _count >= totalVisible;
-    final btnStyle = TextButton.styleFrom(
-      textStyle: const TextStyle(fontFamily: 'Inter Tight', fontSize: 13),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-    );
-
-    return Row(
-      children: [
-        // Left side: close + count + select-all
+    return Container(
+      height: 40,
+      decoration: BoxDecoration(
+        color: t.toolbar,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: t.tbBorder, width: 0.5),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      child: Row(children: [
         IconButton(
-          icon: const Icon(Icons.close),
+          icon: const Icon(Icons.close, size: 16),
           onPressed: onClear,
-          iconSize: 18,
           color: t.inkDim,
-          tooltip: '선택 해제',
           padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+          constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+          tooltip: '선택 해제',
         ),
-        const SizedBox(width: 6),
+        const SizedBox(width: 8),
         Text(
           '$_count개 선택됨',
           style: TextStyle(
             fontFamily: 'Inter Tight',
-            fontSize: 15,
+            fontSize: 13,
             fontWeight: FontWeight.w600,
             color: t.ink,
           ),
         ),
-        const SizedBox(width: 8),
+        const Spacer(),
         if (!allSelected)
           TextButton(
             onPressed: onSelectAll,
-            style: btnStyle.copyWith(
-              foregroundColor: WidgetStatePropertyAll(t.inkDim),
+            style: TextButton.styleFrom(
+              textStyle: const TextStyle(fontFamily: 'Inter Tight', fontSize: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              foregroundColor: t.inkDim,
             ),
             child: const Text('모두 선택'),
           ),
-        const Spacer(),
-        // Single-folder extras
-        if (singleFolder != null) ...[
-          TextButton.icon(
-            onPressed: () => onSingleFolderRename?.call(singleFolder!),
-            icon: const Icon(Icons.edit_outlined, size: 15),
-            label: const Text('이름 수정'),
-            style: btnStyle,
-          ),
-          TextButton.icon(
-            onPressed: () => onSingleFolderAppearance?.call(singleFolder!),
-            icon: const Icon(Icons.color_lens_outlined, size: 15),
-            label: const Text('색상/아이콘'),
-            style: btnStyle,
-          ),
-        ],
-        // Single-note extras
-        if (singleNote != null) ...[
-          TextButton.icon(
-            onPressed: () => onSingleNoteRename?.call(singleNote!),
-            icon: const Icon(Icons.edit_outlined, size: 15),
-            label: const Text('이름 수정'),
-            style: btnStyle,
-          ),
-          TextButton.icon(
-            onPressed: () => onSingleNoteFavorite?.call(singleNote!),
-            icon: Icon(
-              singleNote!.isFavorite ? Icons.star_rounded : Icons.star_border_rounded,
-              size: 15,
-            ),
-            label: Text(singleNote!.isFavorite ? '즐겨찾기 해제' : '즐겨찾기'),
-            style: btnStyle,
-          ),
-          TextButton.icon(
-            onPressed: () => onSingleNoteExport?.call(singleNote!),
-            icon: const Icon(Icons.ios_share_rounded, size: 15),
-            label: const Text('내보내기'),
-            style: btnStyle,
-          ),
-        ],
-        const SizedBox(width: 4),
-        // Common actions
-        TextButton.icon(
-          onPressed: onMove,
-          icon: const Icon(Icons.drive_file_move_outline, size: 15),
-          label: const Text('이동'),
-          style: btnStyle,
-        ),
-        if (onDuplicate != null) ...[
-          const SizedBox(width: 4),
-          TextButton.icon(
-            onPressed: onDuplicate,
-            icon: const Icon(Icons.copy_rounded, size: 15),
-            label: const Text('복제'),
-            style: btnStyle,
-          ),
-        ],
-        const SizedBox(width: 4),
-        TextButton.icon(
-          onPressed: onDelete,
-          icon: const Icon(Icons.delete_outline, size: 15),
-          label: const Text('삭제'),
-          style: btnStyle.copyWith(
-            foregroundColor: const WidgetStatePropertyAll(Color(0xFFEF4444)),
-          ),
-        ),
-      ],
+      ]),
     );
   }
 }
@@ -3510,9 +3586,22 @@ class _Breadcrumb extends ConsumerWidget {
     final ctl = ref.read(libraryProvider.notifier);
     final crumbs = [null, ...state.breadcrumb().map((f) => f.id)];
     final names = ['Library', ...state.breadcrumb().map((f) => f.name)];
+    final isInFolder = crumbs.length > 1;
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
       child: Row(children: [
+        // Back arrow — shown when inside a subfolder.
+        if (isInFolder) ...[
+          InkWell(
+            onTap: ctl.navigateUp,
+            borderRadius: BorderRadius.circular(4),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+              child: NoteeIconWidget(NoteeIcon.chev, size: 11, color: t.inkDim),
+            ),
+          ),
+          const SizedBox(width: 4),
+        ],
         for (var i = 0; i < crumbs.length; i++) ...[
           InkWell(
             onTap: () {
@@ -3615,6 +3704,8 @@ class _FolderTile extends StatelessWidget {
               child: AspectRatio(
                 aspectRatio: 1.3,
                 child: LayoutBuilder(builder: (context, c) {
+                  final iconData = _folderIconFor(folder.iconKey);
+                  final iconSize = c.maxWidth * 0.28;
                   return Stack(children: [
                     // Back tab
                     Positioned(
@@ -3654,39 +3745,17 @@ class _FolderTile extends StatelessWidget {
                         ),
                       ),
                     ),
-                    // Paper peek (rotated -1deg)
+                    // Folder icon — centered in the body area
                     Positioned(
-                      left: 14,
-                      right: 14,
-                      top: 18,
-                      bottom: 16,
-                      child: Transform.rotate(
-                        angle: -0.0175,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: t.page.withValues(alpha: 0.9),
-                            borderRadius: BorderRadius.circular(2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.12),
-                                blurRadius: 2,
-                                offset: const Offset(0, 1),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                    // Top paper
-                    Positioned(
-                      left: 18,
-                      right: 22,
-                      top: 22,
-                      bottom: 20,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: t.page,
-                          borderRadius: BorderRadius.circular(2),
+                      left: 0,
+                      right: 0,
+                      top: 10,
+                      bottom: 0,
+                      child: Center(
+                        child: Icon(
+                          iconData,
+                          size: iconSize,
+                          color: Colors.white.withValues(alpha: 0.85),
                         ),
                       ),
                     ),
@@ -4287,8 +4356,15 @@ Future<void> _showNoteContextMenu(
     ],
   );
   if (!context.mounted || result == null) return;
+  await _executeNoteAction(context, ref, n, result);
+}
+
+/// Executes [action] on note [n] directly (used by floating action menu).
+Future<void> _executeNoteAction(
+    BuildContext context, WidgetRef ref, NoteSummary n, _NoteCtx action) async {
+  if (!context.mounted) return;
   final ctl = ref.read(libraryProvider.notifier);
-  switch (result) {
+  switch (action) {
     case _NoteCtx.rename:
       final name = await noteeAskName(
         context,
@@ -4305,7 +4381,6 @@ Future<void> _showNoteContextMenu(
       if (!context.mounted) return;
       final folderId = await _pickFolder(context, ref, currentFolderId: n.folderId);
       if (folderId != null) {
-        // ('__root__' sentinel = root)
         final target = folderId == '__root__' ? null : folderId;
         await ctl.moveNotebook(n.id, target);
       }
@@ -4316,8 +4391,7 @@ Future<void> _showNoteContextMenu(
       final repo = ref.read(repositoryProvider);
       final nbState = await repo.loadByNoteId(n.id);
       if (nbState == null || !context.mounted) return;
-      final path = await ExportDialog.show(context, nbState,
-          suggestedName: n.title);
+      final path = await ExportDialog.show(context, nbState, suggestedName: n.title);
       if (path != null && context.mounted) {
         ScaffoldMessenger.of(context)
           ..clearSnackBars()
@@ -4326,8 +4400,7 @@ Future<void> _showNoteContextMenu(
             duration: const Duration(seconds: 4),
             action: SnackBarAction(
               label: '닫기',
-              onPressed: () =>
-                  ScaffoldMessenger.of(context).hideCurrentSnackBar(),
+              onPressed: () => ScaffoldMessenger.of(context).hideCurrentSnackBar(),
             ),
           ));
       }
@@ -4340,12 +4413,18 @@ Future<void> _showNoteContextMenu(
         );
         return;
       }
+      // Pass onTokens/onLogout so tokens are kept in sync, and a dead refresh
+      // token forces the user back to the login screen instead of a 401 loop.
+      final historyClient = apiFor(auth, onTokens: (t) {
+        ref.read(authProvider.notifier).updateTokens(t);
+      }, onLogout: () {
+        ref.read(authProvider.notifier).clearTokens();
+      });
       final restored = await Navigator.of(context).push<bool>(
         MaterialPageRoute(
-          builder: (_) => HistoryScreen(noteId: n.id, client: apiFor(auth)),
+          builder: (_) => HistoryScreen(noteId: n.id, client: historyClient),
         ),
       );
-      // Pull restored state if user reverted to a past commit.
       if (restored == true && context.mounted) {
         try {
           await ref.read(syncActionsProvider).syncNow();
@@ -5137,6 +5216,155 @@ class _ActionRow extends StatelessWidget {
             ),
           ),
         ]),
+      ),
+    );
+  }
+}
+
+// ── Floating selection action panel (mobile) ─────────────────────────────
+/// Shows as a floating card at the bottom-right when items are selected.
+/// Contains contextual action buttons depending on what is selected.
+class _SelectionActionPanel extends StatelessWidget {
+  const _SelectionActionPanel({
+    super.key,
+    required this.noteCount,
+    required this.folderCount,
+    // Single-item extras
+    this.singleNote,
+    this.singleFolder,
+    // Shared actions
+    required this.onMove,
+    required this.onDelete,
+    this.onDuplicate,
+    // Note-only actions
+    this.onRenameNote,
+    this.onFavoriteNote,
+    this.onExportNote,
+    this.onHistoryNote,
+    // Folder-only actions
+    this.onRenameFolder,
+    this.onAppearanceFolder,
+  });
+
+  final int noteCount;
+  final int folderCount;
+  final NoteSummary? singleNote;
+  final Folder? singleFolder;
+  final VoidCallback? onMove;
+  final VoidCallback? onDelete;
+  final VoidCallback? onDuplicate;
+  final VoidCallback? onRenameNote;
+  final VoidCallback? onFavoriteNote;
+  final VoidCallback? onExportNote;
+  final VoidCallback? onHistoryNote;
+  final VoidCallback? onRenameFolder;
+  final VoidCallback? onAppearanceFolder;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    final n = singleNote;
+    final f = singleFolder;
+
+    final btns = <_ActionBtn>[];
+
+    if (n != null) {
+      // Single note selected
+      btns.addAll([
+        _ActionBtn(icon: Icons.edit_outlined, label: '이름수정', color: t.ink, onTap: onRenameNote),
+        _ActionBtn(
+          icon: n.isFavorite ? Icons.star_rounded : Icons.star_border_rounded,
+          label: n.isFavorite ? '즐겨찾기\n해제' : '즐겨찾기',
+          color: n.isFavorite ? const Color(0xFFF59E0B) : t.ink,
+          onTap: onFavoriteNote,
+        ),
+        _ActionBtn(icon: Icons.copy_rounded, label: '복제', color: t.ink, onTap: onDuplicate),
+        _ActionBtn(icon: Icons.drive_file_move_outline, label: '이동', color: t.ink, onTap: onMove),
+        _ActionBtn(icon: Icons.ios_share_rounded, label: '내보내기', color: t.ink, onTap: onExportNote),
+        _ActionBtn(icon: Icons.history_rounded, label: '버전기록', color: t.ink, onTap: onHistoryNote),
+        _ActionBtn(icon: Icons.delete_outline, label: '삭제', color: Colors.red.shade600, onTap: onDelete),
+      ]);
+    } else if (f != null) {
+      // Single folder selected
+      btns.addAll([
+        _ActionBtn(icon: Icons.edit_outlined, label: '이름수정', color: t.ink, onTap: onRenameFolder),
+        _ActionBtn(icon: Icons.color_lens_outlined, label: '색상/아이콘', color: t.ink, onTap: onAppearanceFolder),
+        _ActionBtn(icon: Icons.drive_file_move_outline, label: '이동', color: t.ink, onTap: onMove),
+        _ActionBtn(icon: Icons.delete_outline, label: '삭제', color: Colors.red.shade600, onTap: onDelete),
+      ]);
+    } else {
+      // Multiple items selected
+      if (noteCount > 0 && folderCount == 0) {
+        btns.add(_ActionBtn(icon: Icons.copy_rounded, label: '복제', color: t.ink, onTap: onDuplicate));
+      }
+      btns.addAll([
+        _ActionBtn(icon: Icons.drive_file_move_outline, label: '이동', color: t.ink, onTap: onMove),
+        _ActionBtn(icon: Icons.delete_outline, label: '삭제', color: Colors.red.shade600, onTap: onDelete),
+      ]);
+    }
+
+    return Positioned(
+      bottom: 16,
+      right: 16,
+      child: SafeArea(
+        child: Material(
+          color: t.toolbar,
+          borderRadius: BorderRadius.circular(16),
+          elevation: 12,
+          shadowColor: Colors.black38,
+          child: Padding(
+            padding: const EdgeInsets.all(6),
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(mainAxisSize: MainAxisSize.min, children: btns),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Square icon+label action button used in [_SelectionActionPanel].
+class _ActionBtn extends StatelessWidget {
+  const _ActionBtn({
+    required this.icon,
+    required this.label,
+    required this.color,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: SizedBox(
+        width: 56,
+        height: 56,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 20, color: onTap != null ? color : color.withValues(alpha: 0.4)),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 10,
+                color: onTap != null ? color : color.withValues(alpha: 0.4),
+                fontFamily: 'Inter Tight',
+                height: 1.2,
+              ),
+              textAlign: TextAlign.center,
+              maxLines: 2,
+            ),
+          ],
+        ),
       ),
     );
   }

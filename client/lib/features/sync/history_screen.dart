@@ -1,11 +1,15 @@
 // HistoryScreen — browse note commit history and restore to a past state.
 //
 // Each commit shows: message, device ID, creation time, and the rev range.
-// Tapping a commit shows a confirmation sheet before restoring.
+// Tapping a commit opens a snapshot preview screen; a Restore button is there.
+
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import '../../data/api/api_client.dart';
+import '../../domain/page_object.dart';
+import '../../features/canvas/painters/layer_painter.dart';
 import '../../theme/notee_icons.dart';
 import '../../theme/notee_theme.dart';
 
@@ -172,7 +176,21 @@ class _HistoryScreenState extends State<HistoryScreen> {
         commit: commits[i],
         tokens: t,
         isLatest: i == 0,
-        onRestore: () => _restore(commits[i]),
+        onTap: () async {
+          final commit = commits[i];
+          final restored = await Navigator.of(context).push<bool>(
+            MaterialPageRoute(
+              builder: (_) => _SnapshotScreen(
+                noteId: widget.noteId,
+                commit: commit,
+                client: widget.client,
+              ),
+            ),
+          );
+          if (restored == true && mounted) {
+            Navigator.pop(context, true);
+          }
+        },
       ),
     );
   }
@@ -183,13 +201,13 @@ class _CommitTile extends StatelessWidget {
     required this.commit,
     required this.tokens,
     required this.isLatest,
-    required this.onRestore,
+    required this.onTap,
   });
 
   final Map<String, dynamic> commit;
   final NoteeTokens tokens;
   final bool isLatest;
-  final VoidCallback onRestore;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -202,7 +220,7 @@ class _CommitTile extends StatelessWidget {
     final timeStr = createdAt != null ? _formatTime(createdAt) : createdAtRaw;
 
     return InkWell(
-      onTap: onRestore,
+      onTap: onTap,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
         child: Row(
@@ -314,4 +332,285 @@ class _CommitTile extends StatelessWidget {
     }
     return '$label · $suffix';
   }
+}
+
+// ── Snapshot preview screen ───────────────────────────────────────────────────
+
+class _SnapshotScreen extends StatefulWidget {
+  const _SnapshotScreen({
+    required this.noteId,
+    required this.commit,
+    required this.client,
+  });
+
+  final String noteId;
+  final Map<String, dynamic> commit;
+  final ApiClient client;
+
+  @override
+  State<_SnapshotScreen> createState() => _SnapshotScreenState();
+}
+
+class _SnapshotScreenState extends State<_SnapshotScreen> {
+  bool _loading = true;
+  String? _error;
+  List<Stroke> _strokes = [];
+  List<ShapeObject> _shapes = [];
+  bool _restoring = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final data = await widget.client.historySnapshot(
+        widget.noteId,
+        widget.commit['id'] as String,
+      );
+      final objects = (data['objects'] as List?) ?? const [];
+      final strokes = <Stroke>[];
+      final shapes = <ShapeObject>[];
+      for (final obj in objects) {
+        final o = obj as Map<String, dynamic>;
+        final kind = o['kind'] as String? ?? '';
+        final rawData = o['data'];
+        final objData = rawData is Map<String, dynamic>
+            ? rawData
+            : <String, dynamic>{};
+        try {
+          if (kind == 'stroke') {
+            strokes.add(Stroke.fromJson({...objData, 'id': o['id'], 'pageId': o['pageId'], 'layerId': o['layerId']}));
+          } else if (kind == 'shape') {
+            shapes.add(ShapeObject.fromJson({...objData, 'id': o['id'], 'pageId': o['pageId'], 'layerId': o['layerId']}));
+          }
+        } catch (_) {}
+      }
+      if (!mounted) return;
+      setState(() {
+        _strokes = strokes;
+        _shapes = shapes;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _restore() async {
+    final t = NoteeProvider.of(context).tokens;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: t.toolbar,
+        title: Text('복원?', style: TextStyle(color: t.ink, fontSize: 16)),
+        content: Text(
+          '"${widget.commit['message']}" 버전으로 복원합니다.\n현재 변경사항은 대체됩니다.',
+          style: TextStyle(color: t.inkDim, fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('취소', style: TextStyle(color: t.inkDim)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('복원', style: TextStyle(color: t.accent)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _restoring = true);
+    try {
+      await widget.client.historyRestore(
+          widget.noteId, widget.commit['id'] as String);
+      if (!mounted) return;
+      Navigator.pop(context, true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _restoring = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('복원 실패: $e'),
+          backgroundColor: Colors.red.shade700,
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    final message = widget.commit['message'] as String? ?? '';
+    final createdAtRaw = widget.commit['createdAt'] as String? ?? '';
+    final createdAt = DateTime.tryParse(createdAtRaw)?.toLocal();
+    final timeStr = createdAt != null
+        ? '${createdAt.year}/${createdAt.month.toString().padLeft(2, '0')}/${createdAt.day.toString().padLeft(2, '0')} '
+          '${createdAt.hour.toString().padLeft(2, '0')}:${createdAt.minute.toString().padLeft(2, '0')}'
+        : createdAtRaw;
+
+    return Scaffold(
+      backgroundColor: t.bg,
+      appBar: AppBar(
+        backgroundColor: t.toolbar,
+        elevation: 0,
+        leading: IconButton(
+          icon: NoteeIconWidget(NoteeIcon.chev, size: 18, color: t.ink),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(message,
+                style: TextStyle(
+                    color: t.ink, fontSize: 15, fontWeight: FontWeight.w600),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis),
+            Text(timeStr,
+                style: TextStyle(color: t.inkFaint, fontSize: 11)),
+          ],
+        ),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1),
+          child: Divider(height: 1, thickness: 1, color: t.tbBorder),
+        ),
+      ),
+      body: _loading
+          ? Center(child: CircularProgressIndicator(color: t.accent))
+          : _error != null
+              ? Center(
+                  child: Text(_error!,
+                      style: TextStyle(color: t.inkDim, fontSize: 14)))
+              : _SnapshotCanvas(strokes: _strokes, shapes: _shapes, t: t),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+          child: FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: t.accent,
+              minimumSize: const Size.fromHeight(44),
+            ),
+            onPressed: (_loading || _restoring) ? null : _restore,
+            child: _restoring
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.white))
+                : const Text('이 버전으로 복원'),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SnapshotCanvas extends StatelessWidget {
+  const _SnapshotCanvas({
+    required this.strokes,
+    required this.shapes,
+    required this.t,
+  });
+
+  final List<Stroke> strokes;
+  final List<ShapeObject> shapes;
+  final NoteeTokens t;
+
+  @override
+  Widget build(BuildContext context) {
+    if (strokes.isEmpty && shapes.isEmpty) {
+      return Center(
+        child: Text('이 버전에는 내용이 없습니다.',
+            style: TextStyle(color: t.inkFaint, fontSize: 14)),
+      );
+    }
+
+    // Compute bounding box of all objects.
+    double minX = double.infinity,
+        minY = double.infinity,
+        maxX = double.negativeInfinity,
+        maxY = double.negativeInfinity;
+    for (final s in strokes) {
+      minX = math.min(minX, s.bbox.minX);
+      minY = math.min(minY, s.bbox.minY);
+      maxX = math.max(maxX, s.bbox.maxX);
+      maxY = math.max(maxY, s.bbox.maxY);
+    }
+    for (final s in shapes) {
+      minX = math.min(minX, s.bbox.minX);
+      minY = math.min(minY, s.bbox.minY);
+      maxX = math.max(maxX, s.bbox.maxX);
+      maxY = math.max(maxY, s.bbox.maxY);
+    }
+    final padding = 32.0;
+    final contentW = (maxX - minX).clamp(1.0, double.infinity) + padding * 2;
+    final contentH = (maxY - minY).clamp(1.0, double.infinity) + padding * 2;
+
+    return Container(
+      color: t.page,
+      child: LayoutBuilder(builder: (ctx, constraints) {
+        final scaleX = constraints.maxWidth / contentW;
+        final scaleY = constraints.maxHeight / contentH;
+        final scale = math.min(scaleX, scaleY).clamp(0.05, 4.0);
+        return Center(
+          child: SizedBox(
+            width: contentW * scale,
+            height: contentH * scale,
+            child: CustomPaint(
+              painter: _SnapshotPainter(
+                strokes: strokes,
+                shapes: shapes,
+                offsetX: -minX + padding,
+                offsetY: -minY + padding,
+                scale: scale,
+              ),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+}
+
+class _SnapshotPainter extends CustomPainter {
+  _SnapshotPainter({
+    required this.strokes,
+    required this.shapes,
+    required this.offsetX,
+    required this.offsetY,
+    required this.scale,
+  });
+
+  final List<Stroke> strokes;
+  final List<ShapeObject> shapes;
+  final double offsetX;
+  final double offsetY;
+  final double scale;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.save();
+    canvas.scale(scale, scale);
+    canvas.translate(offsetX, offsetY);
+    // Delegate to the existing painter (layerOpacity=1, tape strokes skipped).
+    CombinedLayerPainter(
+      strokes: strokes,
+      shapes: shapes,
+      layerOpacity: 1.0,
+    ).paint(canvas, size);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_SnapshotPainter old) =>
+      old.strokes != strokes ||
+      old.shapes != shapes ||
+      old.scale != scale;
 }
