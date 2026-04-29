@@ -385,6 +385,14 @@ func (s *Service) Push(w http.ResponseWriter, r *http.Request) {
 				localData:  ch.Data,
 				serverData: json.RawMessage(existingData),
 			})
+			// Include the conflicting object's existing server rev so the
+			// client cursor advances past this point. Without this, the
+			// response ServerRev stays 0 (no accepted objects) and the
+			// client re-uses lastServerRev=0 on every subsequent push,
+			// triggering the same conflict indefinitely.
+			if existingRev > resp.ServerRev {
+				resp.ServerRev = existingRev
+			}
 			continue
 		}
 
@@ -1082,6 +1090,17 @@ func (s *Service) ResolveConflict(w http.ResponseWriter, r *http.Request) {
 		switch res.Resolution {
 		case "server":
 			// Server version already applied; nothing to write.
+			// Still fetch its current rev so the client cursor advances
+			// past these objects — otherwise resolveConflict returns
+			// serverRev=0 when all items are "server wins", and the next
+			// push re-uses lastServerRev=0, triggering the same conflict.
+			var serverRev int64
+			if err := tx.QueryRow(r.Context(),
+				`SELECT rev FROM page_objects WHERE id=$1`, objectID).Scan(&serverRev); err == nil {
+				if serverRev > maxRev {
+					maxRev = serverRev
+				}
+			}
 		case "deleted":
 			var newRev int64
 			if err := tx.QueryRow(r.Context(),
