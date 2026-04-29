@@ -221,6 +221,7 @@ class NotebookController extends Notifier<NotebookState> {
     _saveDebouncer?.schedule(() async {
       try {
         await ref.read(repositoryProvider).saveAll(state);
+        ref.read(lastSavedAtProvider.notifier).state = DateTime.now();
         _scheduleThumbnail();
       } catch (_) {/* ignore */}
     });
@@ -1079,6 +1080,9 @@ final _canRedoProvider = StateProvider<bool>((ref) => false);
 /// Public providers — watch these in the toolbar to enable/disable buttons.
 final canUndoProvider = Provider<bool>((ref) => ref.watch(_canUndoProvider));
 final canRedoProvider = Provider<bool>((ref) => ref.watch(_canRedoProvider));
+
+/// Tracks when the notebook was last successfully saved to disk.
+final lastSavedAtProvider = StateProvider<DateTime?>((ref) => null);
 
 final notebookProvider =
     NotifierProvider<NotebookController, NotebookState>(NotebookController.new);

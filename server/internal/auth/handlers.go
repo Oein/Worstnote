@@ -1,9 +1,6 @@
 package auth
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -18,9 +15,8 @@ import (
 
 // Service bundles dependencies for the auth handlers.
 type Service struct {
-	DB         *pgxpool.Pool
-	Issuer     *Issuer
-	RefreshTTL time.Duration
+	DB     *pgxpool.Pool
+	Issuer *Issuer
 
 	// hCaptcha. If HCaptchaSecret is non-empty, signup requires a
 	// captchaToken in the request body which is verified against
@@ -32,11 +28,10 @@ type Service struct {
 	HTTPClient *http.Client
 }
 
-func NewService(db *pgxpool.Pool, issuer *Issuer, refreshTTL time.Duration) *Service {
+func NewService(db *pgxpool.Pool, issuer *Issuer) *Service {
 	return &Service{
 		DB:         db,
 		Issuer:     issuer,
-		RefreshTTL: refreshTTL,
 		HTTPClient: &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -109,10 +104,9 @@ type signupReq struct {
 }
 
 type tokenResp struct {
-	UserID       string `json:"userId"`
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	ExpiresIn    int64  `json:"expiresIn"`
+	UserID      string `json:"userId"`
+	AccessToken string `json:"accessToken"`
+	ExpiresIn   int64  `json:"expiresIn"`
 }
 
 // Signup creates a new user (email + password). Returns access/refresh tokens.
@@ -196,114 +190,24 @@ func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 	s.issueAndRespond(w, r, userID, req.DeviceID)
 }
 
-type refreshReq struct {
-	RefreshToken string `json:"refreshToken"`
-	DeviceID     string `json:"deviceId"`
-}
-
-func (s *Service) Refresh(w http.ResponseWriter, r *http.Request) {
-	var req refreshReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_body", err.Error())
-		return
-	}
-	if req.RefreshToken == "" || req.DeviceID == "" {
-		writeErr(w, http.StatusBadRequest, "missing_fields", "")
-		return
-	}
-	hash := sha256Hex(req.RefreshToken)
-	var sessionID, userID string
-	var expiresAt time.Time
-	var revokedAt *time.Time
-	err := s.DB.QueryRow(r.Context(),
-		`SELECT id, user_id, expires_at, revoked_at FROM auth_sessions
-		 WHERE refresh_token_hash=$1 AND device_id=$2`,
-		hashBytes(req.RefreshToken), req.DeviceID).
-		Scan(&sessionID, &userID, &expiresAt, &revokedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeErr(w, http.StatusUnauthorized, "invalid_refresh", "")
-		return
-	}
-	if err != nil {
-		log.Error().Err(err).Msg("refresh lookup")
-		writeErr(w, http.StatusInternalServerError, "db_error", "")
-		return
-	}
-	if revokedAt != nil || time.Now().UTC().After(expiresAt) {
-		writeErr(w, http.StatusUnauthorized, "expired_refresh", "")
-		return
-	}
-	// Rotate: revoke this session, issue a new one.
-	if _, err := s.DB.Exec(r.Context(),
-		`UPDATE auth_sessions SET revoked_at=now() WHERE id=$1`, sessionID); err != nil {
-		log.Error().Err(err).Msg("revoke session")
-	}
-	_ = hash // not actually used, but kept for future audit
-	s.issueAndRespond(w, r, userID, req.DeviceID)
-}
-
-func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
-	c, ok := ClaimsFromContext(r.Context())
-	if !ok {
-		writeErr(w, http.StatusUnauthorized, "no_session", "")
-		return
-	}
-	if _, err := s.DB.Exec(r.Context(),
-		`UPDATE auth_sessions SET revoked_at=now()
-		 WHERE user_id=$1 AND device_id=$2 AND revoked_at IS NULL`,
-		c.UserID, c.DeviceID); err != nil {
-		log.Error().Err(err).Msg("logout")
-	}
+func (s *Service) Logout(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// issueAndRespond signs a fresh access token, persists a new refresh token,
-// and writes the tokenResp body.
-func (s *Service) issueAndRespond(w http.ResponseWriter, r *http.Request, userID, deviceID string) {
+// issueAndRespond signs a 1-year access token and writes the tokenResp body.
+func (s *Service) issueAndRespond(w http.ResponseWriter, _ *http.Request, userID, deviceID string) {
 	now := time.Now().UTC()
 	access, err := s.Issuer.Sign(userID, deviceID, now)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "sign_failed", "")
 		return
 	}
-	refresh, err := newRefreshToken()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "rng_failed", "")
-		return
-	}
-	if _, err := s.DB.Exec(r.Context(),
-		`INSERT INTO auth_sessions(user_id, device_id, refresh_token_hash, expires_at)
-		 VALUES($1,$2,$3,$4)`,
-		userID, deviceID, hashBytes(refresh), now.Add(s.RefreshTTL)); err != nil {
-		log.Error().Err(err).Msg("insert session")
-		writeErr(w, http.StatusInternalServerError, "db_error", "")
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(tokenResp{
-		UserID:       userID,
-		AccessToken:  access,
-		RefreshToken: refresh,
-		ExpiresIn:    int64(s.Issuer.AccessTTL.Seconds()),
+		UserID:      userID,
+		AccessToken: access,
+		ExpiresIn:   int64(s.Issuer.AccessTTL.Seconds()),
 	})
-}
-
-func newRefreshToken() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-func hashBytes(s string) []byte {
-	h := sha256.Sum256([]byte(s))
-	return h[:]
-}
-
-func sha256Hex(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
 // clientIP extracts the most likely client IP from common proxy headers,

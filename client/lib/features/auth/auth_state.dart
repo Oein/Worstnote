@@ -113,8 +113,7 @@ class AuthController extends AsyncNotifier<AuthState> {
   }
 
   /// Clears local auth tokens without a server call. Used when the server
-  /// reports that the refresh token is invalid — the session is already dead,
-  /// so we just need to clean up local state and prompt re-login.
+  /// returns 401 — cleans up local state and prompts re-login.
   Future<void> clearTokens() async {
     await _storage.delete(_storeKeyTokens);
     final cur = state.value;
@@ -127,8 +126,7 @@ class AuthController extends AsyncNotifier<AuthState> {
     }
   }
 
-  /// Called by external API clients when they refresh the token so the new
-  /// tokens are persisted and the auth state stays up-to-date.
+  /// Called by external API clients to persist updated tokens and keep auth state in sync.
   Future<void> updateTokens(AuthTokens t) async {
     await _persistTokens(t);
     final cur = state.value;
@@ -147,18 +145,17 @@ class AuthController extends AsyncNotifier<AuthState> {
       return;
     }
     final raw =
-        '${t.userId}|${t.accessToken}|${t.refreshToken}|${t.expiresAt.toIso8601String()}';
+        '${t.userId}|${t.accessToken}|${t.expiresAt.toIso8601String()}';
     await _storage.write(_storeKeyTokens, raw);
   }
 
   AuthTokens? _decodeTokens(String raw) {
     final parts = raw.split('|');
-    if (parts.length != 4) return null;
+    if (parts.length != 3) return null;
     return AuthTokens(
       userId: parts[0],
       accessToken: parts[1],
-      refreshToken: parts[2],
-      expiresAt: DateTime.tryParse(parts[3]) ?? DateTime.now(),
+      expiresAt: DateTime.tryParse(parts[2]) ?? DateTime.now(),
     );
   }
 
@@ -183,10 +180,8 @@ final authProvider =
 /// Convenience: build an [ApiClient] for use in sync code. Throws if the
 /// auth state isn't loaded yet.
 ///
-/// Pass [onTokens] to persist refreshed tokens back to the auth state so that
-/// rotated refresh tokens are not lost between requests.
-/// Pass [onLogout] to clear auth state when the refresh token itself is invalid
-/// (so the user is prompted to re-login instead of seeing repeated 401 errors).
+/// Pass [onTokens] to persist tokens back to the auth state.
+/// Pass [onLogout] to clear auth state on 401 so the user is prompted to re-login.
 ApiClient apiFor(AuthState s, {OnTokens? onTokens, OnLogout? onLogout}) => ApiClient(
       baseUrl: s.serverUrl,
       deviceId: s.deviceId,

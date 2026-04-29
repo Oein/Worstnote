@@ -1120,6 +1120,29 @@ class _EditorTopBar extends ConsumerStatefulWidget {
 class _EditorTopBarState extends ConsumerState<_EditorTopBar> {
   bool _exporting = false;
   bool _syncBusy = false;
+  Timer? _refreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    super.dispose();
+  }
+
+  String _relTime(DateTime t) {
+    final d = DateTime.now().toUtc().difference(t.toUtc());
+    if (d.inSeconds < 60) return 'just now';
+    if (d.inMinutes < 60) return '${d.inMinutes}m ago';
+    if (d.inHours < 24) return '${d.inHours}h ago';
+    return '${d.inDays}d ago';
+  }
 
   Future<void> _syncNow() async {
     setState(() => _syncBusy = true);
@@ -1255,7 +1278,8 @@ class _EditorTopBarState extends ConsumerState<_EditorTopBar> {
         const SizedBox(width: 8),
         const SizedBox(width: 8),
         // ── Right: saved indicator / undo / redo / tools ─────────────
-        Text('saved · just now',
+        Text(
+            'saved · ${_relTime(ref.watch(lastSavedAtProvider) ?? DateTime.now())}',
             style: TextStyle(
                 fontFamily: 'JetBrainsMono',
                 fontSize: 10,
