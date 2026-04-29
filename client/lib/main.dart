@@ -1026,6 +1026,24 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   ]),
                 ),
               ),
+              // Floating restore button — shown in canvas top-right when header
+              // is hidden, naturally below any docked toolbar.
+              AnimatedPositioned(
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeInOut,
+                top: _headerVisible ? -48.0 : 8.0,
+                right: 8,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 180),
+                  opacity: _headerVisible ? 0.0 : 1.0,
+                  child: IgnorePointer(
+                    ignoring: _headerVisible,
+                    child: _FloatingHeaderRestoreBtn(
+                      onRestore: () => setState(() => _headerVisible = true),
+                    ),
+                  ),
+                ),
+              ),
             ])),
             if (dock == ToolbarDock.right) toolbar,
             ]),
@@ -1068,24 +1086,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   canvasArea,
                   if (dock == ToolbarDock.bottom) toolbar,
                 ],
-              ),
-            ),
-            AnimatedPositioned(
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeInOut,
-              top: _headerVisible
-                  ? -48.0
-                  : (dock == ToolbarDock.top ? 96.0 + 8 : 8.0),
-              right: 8,
-              child: AnimatedOpacity(
-                duration: const Duration(milliseconds: 180),
-                opacity: _headerVisible ? 0.0 : 1.0,
-                child: IgnorePointer(
-                  ignoring: _headerVisible,
-                  child: _FloatingHeaderRestoreBtn(
-                    onRestore: () => setState(() => _headerVisible = true),
-                  ),
-                ),
               ),
             ),
           ],
