@@ -10,6 +10,7 @@
 // Compact widths (< 720px) collapse the sidebar into an icon strip.
 
 import 'dart:async';
+import 'dart:convert' show jsonEncode;
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -43,6 +44,7 @@ import '../auth/auth_state.dart';
 import '../auth/login_dialog.dart';
 import '../lock/note_lock_service.dart';
 import '../notebook/notebook_state.dart';
+import '../sync/history_screen.dart';
 import '../sync/sync_actions.dart';
 import '../sync/sync_state.dart';
 import 'library_state.dart';
@@ -1283,6 +1285,383 @@ class _SyncProgressStripState extends ConsumerState<_SyncProgressStrip> {
   }
 }
 
+// ── Conflict banner shown above the library when push hit a server-side
+//    conflict. Tapping opens the resolution dialog.
+class _ConflictBanner extends ConsumerWidget {
+  const _ConflictBanner();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = NoteeProvider.of(context).tokens;
+    final conflicts = ref.watch(pendingConflictsProvider);
+    if (conflicts.isEmpty) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Material(
+        color: const Color(0xFFFEF3C7), // amber-100 — warning, not error
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: () async {
+            await showDialog<void>(
+              context: context,
+              builder: (_) => _ConflictResolutionDialog(
+                noteId: conflicts.keys.first,
+                sessionId: conflicts.values.first,
+              ),
+            );
+          },
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(children: [
+              const Icon(Icons.warning_amber_rounded,
+                  size: 18, color: Color(0xFFB45309)),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('${conflicts.length}개 노트에서 충돌이 발생했어요',
+                        style: TextStyle(
+                            color: const Color(0xFF78350F),
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text('서버의 다른 변경과 겹쳐서 일부 변경사항이 적용되지 않았습니다. 탭해서 해결.',
+                        style: TextStyle(
+                            color: t.inkDim.withValues(alpha: 0.75),
+                            fontSize: 11)),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              const Icon(Icons.chevron_right, size: 18, color: Color(0xFF78350F)),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Conflict resolution dialog ───────────────────────────────────────────
+class _ConflictResolutionDialog extends ConsumerStatefulWidget {
+  const _ConflictResolutionDialog({
+    required this.noteId,
+    required this.sessionId,
+  });
+  final String noteId;
+  final String sessionId;
+
+  @override
+  ConsumerState<_ConflictResolutionDialog> createState() =>
+      _ConflictResolutionDialogState();
+}
+
+class _ConflictResolutionDialogState
+    extends ConsumerState<_ConflictResolutionDialog> {
+  bool _loading = true;
+  String? _error;
+  Map<String, dynamic>? _detail;
+  // itemId → resolution: 'local' | 'server' | 'deleted'
+  final Map<String, String> _picks = {};
+  bool _applying = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final auth = ref.read(authProvider).value;
+    if (auth == null || !auth.isLoggedIn) return;
+    final api = apiFor(auth);
+    try {
+      final data = await api.conflictGet(widget.noteId, widget.sessionId);
+      if (!mounted) return;
+      setState(() {
+        _detail = data;
+        // Default every item to "server wins" — the safer choice when the
+        // user just wants to dismiss the banner without thinking.
+        for (final item in (data['items'] as List? ?? [])) {
+          _picks[(item as Map<String, dynamic>)['id'] as String] = 'server';
+        }
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _apply() async {
+    final auth = ref.read(authProvider).value;
+    if (auth == null || !auth.isLoggedIn) return;
+    final api = apiFor(auth);
+    setState(() => _applying = true);
+    try {
+      await api.conflictResolve(widget.noteId, widget.sessionId, [
+        for (final entry in _picks.entries)
+          {'itemId': entry.key, 'resolution': entry.value},
+      ]);
+      // Server applied the picks — drop the local pending entry.
+      await ref.read(pendingConflictsProvider.notifier).clear(widget.noteId);
+      // Pull the resolved state back so the local DB picks up the chosen
+      // server values for any "server"/"deleted" picks.
+      try {
+        await ref.read(syncActionsProvider).syncNow();
+      } catch (_) {}
+      if (!mounted) return;
+      Navigator.of(context).pop();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _applying = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NoteeProvider.of(context).tokens;
+    final items = (_detail?['items'] as List?) ?? const [];
+    return Dialog(
+      backgroundColor: t.toolbar,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 560, maxHeight: 640),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(children: [
+                Text('충돌 해결',
+                    style: TextStyle(
+                        fontFamily: 'Newsreader',
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                        color: t.ink)),
+                const Spacer(),
+                Text('항목 ${items.length}개',
+                    style: TextStyle(
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 11,
+                        color: t.inkFaint)),
+              ]),
+              const SizedBox(height: 6),
+              Text(
+                '같은 항목을 다른 기기에서 동시에 수정해 충돌이 났어요. 항목별로 어느 쪽을 둘지 골라주세요.',
+                style: TextStyle(color: t.inkDim, fontSize: 12),
+              ),
+              const SizedBox(height: 12),
+              if (_loading)
+                const Padding(
+                  padding: EdgeInsets.all(20),
+                  child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+                )
+              else if (_error != null)
+                Text(_error!,
+                    style: const TextStyle(
+                        color: Color(0xFFDC2626), fontSize: 12))
+              else
+                Flexible(
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: items.length,
+                    separatorBuilder: (_, __) =>
+                        Divider(height: 1, thickness: 1, color: t.tbBorder),
+                    itemBuilder: (_, i) {
+                      final item = items[i] as Map<String, dynamic>;
+                      final id = item['id'] as String;
+                      return _ConflictItemRow(
+                        item: item,
+                        pick: _picks[id] ?? 'server',
+                        onPick: (r) => setState(() => _picks[id] = r),
+                        t: t,
+                      );
+                    },
+                  ),
+                ),
+              const SizedBox(height: 12),
+              Row(children: [
+                TextButton(
+                  onPressed: _applying
+                      ? null
+                      : () async {
+                          // Default all to "server" and apply — fast path
+                          // for users who just want to discard local changes.
+                          for (final item in items) {
+                            _picks[(item as Map)['id'] as String] = 'server';
+                          }
+                          await _apply();
+                        },
+                  child: const Text('서버 변경 우선 (전체)'),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: _applying ? null : () => Navigator.of(context).pop(),
+                  child: const Text('나중에'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: (_applying || _loading || _error != null)
+                      ? null
+                      : _apply,
+                  child: _applying
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Text('적용'),
+                ),
+              ]),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ConflictItemRow extends StatelessWidget {
+  const _ConflictItemRow({
+    required this.item,
+    required this.pick,
+    required this.onPick,
+    required this.t,
+  });
+  final Map<String, dynamic> item;
+  final String pick;
+  final void Function(String) onPick;
+  final NoteeTokens t;
+
+  @override
+  Widget build(BuildContext context) {
+    final objectId = item['objectId'] as String? ?? '';
+    final localData = jsonEncode(item['localData']);
+    final serverData = jsonEncode(item['serverData']);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('객체 ${objectId.length > 8 ? objectId.substring(0, 8) : objectId}',
+              style: TextStyle(
+                  fontFamily: 'JetBrainsMono',
+                  fontSize: 11,
+                  color: t.inkFaint)),
+          const SizedBox(height: 4),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: _ConflictDataBox(
+                  title: '내 변경',
+                  body: localData,
+                  selected: pick == 'local',
+                  onTap: () => onPick('local'),
+                  t: t,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _ConflictDataBox(
+                  title: '서버 변경',
+                  body: serverData,
+                  selected: pick == 'server',
+                  onTap: () => onPick('server'),
+                  t: t,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton(
+              onPressed: () => onPick('deleted'),
+              child: Text(
+                pick == 'deleted' ? '✓ 삭제됨' : '둘 다 삭제',
+                style: TextStyle(
+                    fontSize: 11,
+                    color: pick == 'deleted'
+                        ? const Color(0xFFDC2626)
+                        : t.inkDim),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ConflictDataBox extends StatelessWidget {
+  const _ConflictDataBox({
+    required this.title,
+    required this.body,
+    required this.selected,
+    required this.onTap,
+    required this.t,
+  });
+  final String title;
+  final String body;
+  final bool selected;
+  final VoidCallback onTap;
+  final NoteeTokens t;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: selected ? t.accentSoft : Colors.transparent,
+      borderRadius: BorderRadius.circular(6),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            border: Border.all(
+              color: selected ? t.accent : t.tbBorder,
+              width: selected ? 1.5 : 1,
+            ),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title,
+                  style: TextStyle(
+                      fontFamily: 'Inter Tight',
+                      fontWeight: FontWeight.w600,
+                      fontSize: 11,
+                      color: selected ? t.accent : t.inkDim)),
+              const SizedBox(height: 4),
+              Text(
+                body.length > 140 ? '${body.substring(0, 140)}…' : body,
+                style: TextStyle(
+                    fontFamily: 'JetBrainsMono',
+                    fontSize: 10,
+                    color: t.ink),
+                maxLines: 5,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // ── Sync transfer queue viewer ───────────────────────────────────────────
 class _SyncQueueDialog extends ConsumerStatefulWidget {
   const _SyncQueueDialog();
@@ -2062,6 +2441,9 @@ class _MainAreaState extends ConsumerState<_MainArea> {
           const SizedBox(height: 8),
           // Thin sync progress bar — only visible while sync is active.
           const _SyncProgressStrip(),
+          // Conflict banner — only visible if any push hit a server-side
+          // conflict that still needs the user's resolution.
+          const _ConflictBanner(),
           const SizedBox(height: 6),
           // Multi-select bar replaces header when items are selected.
           if (_selectionMode)
@@ -3853,7 +4235,7 @@ String _relTime(DateTime t) {
 }
 
 // ── Right-click context menus ─────────────────────────────────────────
-enum _NoteCtx { rename, duplicate, move, favorite, export, delete }
+enum _NoteCtx { rename, duplicate, move, favorite, export, history, delete }
 enum _FolderCtx { rename, changeAppearance, delete }
 
 Future<void> _showNoteContextMenu(
@@ -3889,6 +4271,11 @@ Future<void> _showNoteContextMenu(
         label: '내보내기',
         value: _NoteCtx.export,
         icon: Icon(Icons.ios_share_rounded, size: 16),
+      ),
+      const NoteeMenuItem(
+        label: '버전 기록',
+        value: _NoteCtx.history,
+        icon: Icon(Icons.history_rounded, size: 16),
       ),
       const NoteeMenuItem.separator(),
       const NoteeMenuItem(
@@ -3943,6 +4330,27 @@ Future<void> _showNoteContextMenu(
                   ScaffoldMessenger.of(context).hideCurrentSnackBar(),
             ),
           ));
+      }
+    case _NoteCtx.history:
+      if (!context.mounted) return;
+      final auth = ref.read(authProvider).value;
+      if (auth == null || !auth.isLoggedIn) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('버전 기록은 로그인 후에 사용할 수 있습니다.')),
+        );
+        return;
+      }
+      final restored = await Navigator.of(context).push<bool>(
+        MaterialPageRoute(
+          builder: (_) => HistoryScreen(noteId: n.id, client: apiFor(auth)),
+        ),
+      );
+      // Pull restored state if user reverted to a past commit.
+      if (restored == true && context.mounted) {
+        try {
+          await ref.read(syncActionsProvider).syncNow();
+          await ref.read(libraryProvider.notifier).refresh();
+        } catch (_) {}
       }
     case _NoteCtx.delete:
       if (!context.mounted) return;

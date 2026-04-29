@@ -802,7 +802,10 @@ func (s *Service) HistoryRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
-	// Collect snapshot objects (rev <= revTo, alive at that time).
+	// Collect the *historical* snapshot from the revisions log: for each
+	// object, take its newest revision with rev <= revTo, and keep only the
+	// ones whose final state at that point was "alive" (deleted = false).
+	// This reads true historical data, not the current page_objects row.
 	type snapshotRow struct {
 		id      string
 		pageID  string
@@ -815,11 +818,12 @@ func (s *Service) HistoryRestore(w http.ResponseWriter, r *http.Request) {
 		bboxXY  *float64
 	}
 	snapRows, err := tx.Query(r.Context(),
-		`SELECT id, page_id, layer_id, kind, data,
-			bbox_minx, bbox_miny, bbox_maxx, bbox_maxy
-		 FROM page_objects
-		 WHERE page_id IN (SELECT id FROM pages WHERE note_id=$1)
-		   AND rev <= $2 AND deleted = false`,
+		`SELECT DISTINCT ON (object_id)
+		   object_id, page_id, layer_id, kind, data,
+		   bbox_minx, bbox_miny, bbox_maxx, bbox_maxy, deleted
+		 FROM page_object_revisions
+		 WHERE note_id=$1 AND rev <= $2
+		 ORDER BY object_id, rev DESC`,
 		noteID, revTo)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "snapshot_query", err.Error())
@@ -830,8 +834,12 @@ func (s *Service) HistoryRestore(w http.ResponseWriter, r *http.Request) {
 	snapIDs := map[string]struct{}{}
 	for snapRows.Next() {
 		var sr snapshotRow
+		var deletedAtRev bool
 		if err := snapRows.Scan(&sr.id, &sr.pageID, &sr.layerID, &sr.kind, &sr.data,
-			&sr.bboxMX, &sr.bboxMY, &sr.bboxXX, &sr.bboxXY); err == nil {
+			&sr.bboxMX, &sr.bboxMY, &sr.bboxXX, &sr.bboxXY, &deletedAtRev); err == nil {
+			if deletedAtRev {
+				continue
+			}
 			snapshots = append(snapshots, sr)
 			snapIDs[sr.id] = struct{}{}
 		}
@@ -862,7 +870,9 @@ func (s *Service) HistoryRestore(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	var maxRev int64
 
-	// Tombstone objects not in snapshot.
+	// Tombstone objects not in snapshot. Each tombstone is a real update to
+	// page_objects AND an append to page_object_revisions so the restore is
+	// itself part of history.
 	for _, id := range toDelete {
 		var newRev int64
 		if err := tx.QueryRow(r.Context(),
@@ -876,12 +886,24 @@ func (s *Service) HistoryRestore(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "tombstone", err.Error())
 			return
 		}
+		// Mirror to revision log so future History queries see this delete.
+		if _, err := tx.Exec(r.Context(),
+			`INSERT INTO page_object_revisions(object_id, note_id, page_id, layer_id,
+			   kind, data, rev, deleted, device_id, committed_at)
+			 SELECT id, $1, page_id, layer_id, kind, data, $2, true, $3, $4
+			 FROM page_objects WHERE id=$5`,
+			noteID, newRev, c.DeviceID, now, id); err != nil {
+			writeErr(w, http.StatusInternalServerError, "tombstone_revision", err.Error())
+			return
+		}
 		if newRev > maxRev {
 			maxRev = newRev
 		}
 	}
 
-	// Re-apply snapshot objects with fresh revisions.
+	// Re-apply snapshot objects with fresh revisions. CRITICAL: write the
+	// historical data and bbox back to page_objects, not just bump the rev —
+	// the live row may currently hold a *newer* edit that we're undoing.
 	for _, sr := range snapshots {
 		var newRev int64
 		if err := tx.QueryRow(r.Context(),
@@ -890,9 +912,25 @@ func (s *Service) HistoryRestore(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := tx.Exec(r.Context(),
-			`UPDATE page_objects SET rev=$1, updated_at=$2, deleted=false WHERE id=$3`,
+			`UPDATE page_objects SET data=$1,
+			   bbox_minx=$2, bbox_miny=$3, bbox_maxx=$4, bbox_maxy=$5,
+			   rev=$6, updated_at=$7, deleted=false WHERE id=$8`,
+			sr.data, sr.bboxMX, sr.bboxMY, sr.bboxXX, sr.bboxXY,
 			newRev, now, sr.id); err != nil {
 			writeErr(w, http.StatusInternalServerError, "restore_apply", err.Error())
+			return
+		}
+		// Append the restored state as a fresh revision so the new commit
+		// row created below contains its diff.
+		if _, err := tx.Exec(r.Context(),
+			`INSERT INTO page_object_revisions(object_id, note_id, page_id, layer_id,
+			   kind, data, bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
+			   rev, deleted, device_id, committed_at)
+			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,$12,$13)`,
+			sr.id, noteID, sr.pageID, sr.layerID, sr.kind, sr.data,
+			sr.bboxMX, sr.bboxMY, sr.bboxXX, sr.bboxXY,
+			newRev, c.DeviceID, now); err != nil {
+			writeErr(w, http.StatusInternalServerError, "restore_revision", err.Error())
 			return
 		}
 		if newRev > maxRev {

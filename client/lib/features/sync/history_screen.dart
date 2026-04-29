@@ -285,8 +285,33 @@ class _CommitTile extends StatelessWidget {
     return '${dt.month}/${dt.day}/${dt.year}';
   }
 
+  /// Decodes the deviceId platform prefix into a readable label.
+  /// AuthController writes ids as "<platformTag>-<uuid>" — see _ensureDeviceId.
+  ///   mac-...  → "macOS"
+  ///   and-...  → "Android"
+  ///   ios-...  → "iOS"
+  ///   web-...  → "Web"
+  /// A short suffix is appended so two devices on the same platform can be
+  /// told apart at a glance.
   String _shortDevice(String id) {
-    if (id.length <= 8) return id;
-    return id.substring(0, 8);
+    String label;
+    String suffix;
+    final dash = id.indexOf('-');
+    if (dash > 0 && dash < 6) {
+      final tag = id.substring(0, dash);
+      label = switch (tag) {
+        'mac' => 'macOS',
+        'and' => 'Android',
+        'ios' => 'iOS',
+        'web' => 'Web',
+        _ => tag,
+      };
+      final rest = id.substring(dash + 1);
+      suffix = rest.length > 6 ? rest.substring(0, 6) : rest;
+    } else {
+      label = '디바이스';
+      suffix = id.length > 6 ? id.substring(0, 6) : id;
+    }
+    return '$label · $suffix';
   }
 }

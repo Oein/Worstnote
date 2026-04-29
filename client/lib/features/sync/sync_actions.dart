@@ -193,6 +193,98 @@ final pendingAssetNotesProvider =
     NotifierProvider<PendingAssetNotesNotifier, Set<String>>(
         PendingAssetNotesNotifier.new);
 
+// Disk-backed store of "noteId → conflictSessionId" for conflicts that
+// were detected by the server during a push and still need user resolution.
+// Persisted so a closed app, a switched window, or a fresh launch all see
+// the same set of unresolved conflicts.
+class _PendingConflictsStore {
+  _PendingConflictsStore._();
+  static final _PendingConflictsStore instance = _PendingConflictsStore._();
+
+  Future<File> _file() async {
+    final docs = await getApplicationDocumentsDirectory();
+    return File(p.join(docs.path, 'notee-pending-conflicts.json'));
+  }
+
+  Future<Map<String, String>> read() async {
+    try {
+      final f = await _file();
+      if (!await f.exists()) return {};
+      final raw = await f.readAsString();
+      if (raw.trim().isEmpty) return {};
+      final j = jsonDecode(raw) as Map<String, dynamic>;
+      return j.map((k, v) => MapEntry(k, v.toString()));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<void> _writeRaw(Map<String, String> m) async {
+    try {
+      final f = await _file();
+      await f.writeAsString(jsonEncode(m), flush: true);
+    } catch (_) {}
+  }
+
+  Future<void> set(String noteId, String sid) async {
+    final cur = await read();
+    if (cur[noteId] == sid) return;
+    cur[noteId] = sid;
+    await _writeRaw(cur);
+  }
+
+  Future<void> clear(String noteId) async {
+    final cur = await read();
+    if (!cur.containsKey(noteId)) return;
+    cur.remove(noteId);
+    await _writeRaw(cur);
+  }
+}
+
+class PendingConflictsNotifier extends Notifier<Map<String, String>> {
+  Timer? _poller;
+
+  @override
+  Map<String, String> build() {
+    _bootstrap();
+    ref.onDispose(() => _poller?.cancel());
+    return {};
+  }
+
+  Future<void> _bootstrap() async {
+    await _refresh();
+    _poller ??= Timer.periodic(const Duration(seconds: 3), (_) => _refresh());
+  }
+
+  Future<void> _refresh() async {
+    final cur = await _PendingConflictsStore.instance.read();
+    if (!_eq(cur, state)) state = cur;
+  }
+
+  bool _eq(Map<String, String> a, Map<String, String> b) {
+    if (a.length != b.length) return false;
+    for (final entry in a.entries) {
+      if (b[entry.key] != entry.value) return false;
+    }
+    return true;
+  }
+
+  Future<void> register(String noteId, String sid) async {
+    state = {...state, noteId: sid};
+    await _PendingConflictsStore.instance.set(noteId, sid);
+  }
+
+  Future<void> clear(String noteId) async {
+    if (!state.containsKey(noteId)) return;
+    state = {...state}..remove(noteId);
+    await _PendingConflictsStore.instance.clear(noteId);
+  }
+}
+
+final pendingConflictsProvider =
+    NotifierProvider<PendingConflictsNotifier, Map<String, String>>(
+        PendingConflictsNotifier.new);
+
 // Priority levels — same semantics as PdfRenderCache:
 //   p0: user-requested (note being opened right now)
 //   p1: current sync session (active push or pull)
@@ -930,7 +1022,22 @@ class SyncActions {
       'layers': layersFlat,
       'changes': changes,
     };
-    await api.syncPush(s.note.id, body);
+    final resp = await api.syncPush(s.note.id, body);
+
+    // Server marks objects whose server rev advanced past the rev we
+    // submitted as "conflicting" — they're parked in conflict_items, not
+    // applied. The client must surface this to the user; silently dropping
+    // means lost data.
+    final sid = (resp['conflictSessionId'] as String?) ?? '';
+    if (sid.isNotEmpty) {
+      debugPrint('[Sync] note ${s.note.id} has conflict session $sid');
+      try {
+        await ref.read(pendingConflictsProvider.notifier)
+            .register(s.note.id, sid);
+      } catch (e) {
+        debugPrint('[Sync] failed to register conflict: $e');
+      }
+    }
 
     return (pushed: changes.length);
   }
