@@ -51,8 +51,9 @@ class StrokeBuilder {
   int? _t0Ms;
 
   /// Drop new samples that moved less than this many points from the previous
-  /// retained sample (cheap dejitter — avoids millions of microscopic deltas).
-  static const double _minMovePt = 1.0;
+  /// retained sample (deduplication guard — filters near-zero floating point
+  /// noise without blocking legitimate fine movements at high zoom).
+  static const double _minMovePt = 0.1;
 
   bool get isEmpty => _points.isEmpty;
   int get pointCount => _points.length;
