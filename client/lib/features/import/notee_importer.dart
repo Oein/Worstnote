@@ -115,6 +115,7 @@ class NoteeImporter {
       strokesByPage: strokesByPage,
       shapesByPage: shapesByPage,
       textsByPage: textsByPage,
+      imagesByPage: {for (final p in pages) p.id: const <ImageObject>[]},
       activeLayerByPage: activeLayerByPage,
     );
   }

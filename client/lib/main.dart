@@ -8,6 +8,7 @@
 
 import 'dart:async';
 import 'dart:io' show Process;
+import 'dart:ui' as ui;
 
 import 'package:dio/dio.dart';
 
@@ -32,6 +33,8 @@ import 'package:notee/features/canvas/scroll/page_scroller.dart';
 import 'package:notee/features/canvas/selection/selection_state.dart';
 import 'package:notee/features/canvas/widgets/canvas_view.dart';
 import 'package:notee/features/export/export_dialog.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:notee/core/ids.dart' show newId;
 import 'package:notee/features/import/asset_service.dart';
 import 'package:notee/features/import/image_importer.dart';
 import 'package:notee/features/import/pdf_render_cache.dart';
@@ -1061,6 +1064,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                       height: _headerVisible ? 44.0 : 0.0,
                       child: _EditorTopBar(
                         noteId: note.id,
+                        activePageId: _activePageIndex < state.pages.length
+                            ? state.pages[_activePageIndex].id
+                            : state.pages.first.id,
                         stylusOnly: stylusOnly,
                         showPages: _showPages,
                         activePageIndex: _activePageIndex,
@@ -1122,6 +1128,7 @@ class _HorizSyncController extends ScrollController {
 class _EditorTopBar extends ConsumerStatefulWidget {
   const _EditorTopBar({
     required this.noteId,
+    required this.activePageId,
     required this.stylusOnly,
     required this.showPages,
     required this.activePageIndex,
@@ -1134,6 +1141,7 @@ class _EditorTopBar extends ConsumerStatefulWidget {
     this.onScrollToPage,
   });
   final String noteId;
+  final String activePageId;
   final bool stylusOnly;
   final bool showPages;
   final int activePageIndex;
@@ -1152,6 +1160,7 @@ class _EditorTopBar extends ConsumerStatefulWidget {
 class _EditorTopBarState extends ConsumerState<_EditorTopBar> {
   bool _exporting = false;
   bool _syncBusy = false;
+  bool _insertingImage = false;
   Timer? _refreshTimer;
 
   @override
@@ -1240,6 +1249,83 @@ class _EditorTopBarState extends ConsumerState<_EditorTopBar> {
 
   Future<void> _share() => _export();
 
+  Future<void> _pickAndInsertImage(ImageSource source) async {
+    if (_insertingImage) return;
+    setState(() => _insertingImage = true);
+    try {
+      final picker = ImagePicker();
+      final xfile = await picker.pickImage(source: source);
+      if (xfile == null || !mounted) return;
+      final bytes = await xfile.readAsBytes();
+      final mime = xfile.mimeType ?? 'image/jpeg';
+      final assetRef = await AssetService().putBytes(bytes, mime: mime);
+      // Decode dimensions.
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      final iw = frame.image.width.toDouble();
+      final ih = frame.image.height.toDouble();
+      frame.image.dispose();
+      // Fit inside the page, centred.
+      final page = ref.read(notebookProvider).pages
+          .firstWhere((p) => p.id == widget.activePageId);
+      final pw = page.spec.widthPt;
+      final ph = page.spec.heightPt;
+      final maxW = pw * 0.6;
+      final maxH = ph * 0.6;
+      final scale = (maxW / iw).clamp(0.0, maxH / ih).clamp(0.0, 1.0);
+      final w = iw * scale;
+      final h = ih * scale;
+      final left = (pw - w) / 2;
+      final top = (ph - h) / 2;
+      final img = ImageObject(
+        id: newId(),
+        pageId: widget.activePageId,
+        layerId: '',
+        assetId: assetRef.id,
+        bbox: Bbox(minX: left, minY: top, maxX: left + w, maxY: top + h),
+        createdAt: DateTime.now().toUtc(),
+      );
+      ref.read(notebookProvider.notifier).addImage(img);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('이미지 추가 실패: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _insertingImage = false);
+    }
+  }
+
+  Future<void> _showImageSourceSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.camera_alt_outlined),
+              title: const Text('카메라'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickAndInsertImage(ImageSource.camera);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('사진 선택'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickAndInsertImage(ImageSource.gallery);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _openFile(String path) {
     Process.run('open', [path]);
   }
@@ -1321,6 +1407,17 @@ class _EditorTopBarState extends ConsumerState<_EditorTopBar> {
           tooltip: '전체화면',
           icon: const Icon(Icons.fullscreen, size: 20),
           onPressed: widget.onToggleHeader,
+        ),
+        IconButton(
+          tooltip: '이미지 추가',
+          icon: _insertingImage
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.add_photo_alternate_outlined, size: 20),
+          onPressed: _insertingImage ? null : _showImageSourceSheet,
         ),
         _EditorCloudButton(noteId: widget.noteId, onSyncNow: _syncBusy ? null : _syncNow),
         _NoteSettingsBtn(
@@ -2100,6 +2197,8 @@ class _CanvasFor extends ConsumerWidget {
         state.shapesByPage[pageId] ?? const <ShapeObject>[]);
     final textsByLayer = _groupBy<TextBoxObject>(
         state.textsByPage[pageId] ?? const <TextBoxObject>[]);
+    final imagesByLayer = _groupBy<ImageObject>(
+        state.imagesByPage[pageId] ?? const <ImageObject>[]);
 
     final activeLayerId = state.activeLayerByPage[pageId] ?? '';
     final inputMode = tool.inputDrawMode == InputDrawMode.stylusOnly
@@ -2136,6 +2235,7 @@ class _CanvasFor extends ConsumerWidget {
       strokesByLayer: strokesByLayer,
       shapesByLayer: shapesByLayer,
       textsByLayer: textsByLayer,
+      imagesByLayer: imagesByLayer,
       activeLayerId: activeLayerId,
       tool: kind,
       colorArgb: color,
@@ -2165,6 +2265,8 @@ Map<String, List<T>> _groupBy<T>(List<T> all) {
     } else if (o is ShapeObject) {
       id = o.layerId;
     } else if (o is TextBoxObject) {
+      id = o.layerId;
+    } else if (o is ImageObject) {
       id = o.layerId;
     } else {
       continue;

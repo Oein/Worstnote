@@ -264,6 +264,7 @@ class LibraryController extends AsyncNotifier<LibraryState> {
       strokesByPage: strokesByPage,
       shapesByPage: shapesByPage,
       textsByPage: textsByPage,
+      imagesByPage: {for (final p in pages) p.id: const <ImageObject>[]},
       activeLayerByPage: activeLayerByPage,
     );
 
@@ -297,6 +298,7 @@ class LibraryController extends AsyncNotifier<LibraryState> {
       strokesByPage: imp.strokesByPage,
       shapesByPage: {for (final p in imp.pages) p.id: const <ShapeObject>[]},
       textsByPage: imp.textsByPage,
+      imagesByPage: {for (final p in imp.pages) p.id: const <ImageObject>[]},
       activeLayerByPage: imp.activeLayerByPage,
     );
     await ref.read(repositoryProvider).saveAll(fresh);
@@ -393,6 +395,14 @@ class LibraryController extends AsyncNotifier<LibraryState> {
       strokesByPage: strokesByPage,
       shapesByPage: shapesByPage,
       textsByPage: textsByPage,
+      imagesByPage: remapPage(
+        imported.imagesByPage,
+        (img, pid) => img.copyWith(
+          id: newId(),
+          pageId: pid,
+          layerId: layerIdMap[img.layerId] ?? img.layerId,
+        ),
+      ),
       activeLayerByPage: activeLayerByPage,
     );
 

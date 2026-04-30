@@ -73,6 +73,24 @@ class TextBoxObject with _$TextBoxObject {
       _$TextBoxObjectFromJson(json);
 }
 
+@freezed
+class ImageObject with _$ImageObject {
+  const factory ImageObject({
+    required String id,
+    required String pageId,
+    required String layerId,
+    required Bbox bbox,
+    required String assetId,
+    required DateTime createdAt,
+    String? createdBy,
+    @Default(0) int rev,
+    @Default(false) bool deleted,
+  }) = _ImageObject;
+
+  factory ImageObject.fromJson(Map<String, dynamic> json) =>
+      _$ImageObjectFromJson(json);
+}
+
 /// Sealed supertype for collections that hold any drawable.
 sealed class PageObject {
   String get id;
@@ -140,4 +158,23 @@ class TextPO implements PageObject {
   bool get deleted => text.deleted;
   @override
   DateTime get createdAt => text.createdAt;
+}
+
+class ImagePO implements PageObject {
+  ImagePO(this.image);
+  final ImageObject image;
+  @override
+  String get id => image.id;
+  @override
+  String get pageId => image.pageId;
+  @override
+  String get layerId => image.layerId;
+  @override
+  Bbox get bbox => image.bbox;
+  @override
+  int get rev => image.rev;
+  @override
+  bool get deleted => image.deleted;
+  @override
+  DateTime get createdAt => image.createdAt;
 }

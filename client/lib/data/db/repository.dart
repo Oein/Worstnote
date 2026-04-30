@@ -396,6 +396,7 @@ class NotebookRepository {
     final clonedStrokesByPage = <String, List<Stroke>>{};
     final clonedShapesByPage = <String, List<ShapeObject>>{};
     final clonedTextsByPage = <String, List<TextBoxObject>>{};
+    final clonedImagesByPage = <String, List<ImageObject>>{};
     final clonedActiveLayer = <String, String>{};
 
     for (final p in loaded.pages) {
@@ -434,6 +435,14 @@ class NotebookRepository {
                 rev: 0,
               ))
           .toList();
+      clonedImagesByPage[newPid] = (loaded.imagesByPage[p.id] ?? const <ImageObject>[])
+          .map((img) => img.copyWith(
+                id: mkId(),
+                pageId: newPid,
+                layerId: layerMap[img.layerId] ?? layers.first.id,
+                rev: 0,
+              ))
+          .toList();
     }
 
     final cloned = NotebookState(
@@ -443,6 +452,7 @@ class NotebookRepository {
       strokesByPage: clonedStrokesByPage,
       shapesByPage: clonedShapesByPage,
       textsByPage: clonedTextsByPage,
+      imagesByPage: clonedImagesByPage,
       activeLayerByPage: clonedActiveLayer,
     );
     await saveAll(cloned);
@@ -513,6 +523,10 @@ class NotebookRepository {
         }
         for (final o in s.textsByPage[p.id] ?? const <TextBoxObject>[]) {
           await _putObject(o.id, o.pageId, o.layerId, 'text',
+              jsonEncode(o.toJson()), o.bbox, o.rev, o.deleted, o.createdBy);
+        }
+        for (final o in s.imagesByPage[p.id] ?? const <ImageObject>[]) {
+          await _putObject(o.id, o.pageId, o.layerId, 'image',
               jsonEncode(o.toJson()), o.bbox, o.rev, o.deleted, o.createdBy);
         }
       }
@@ -671,6 +685,7 @@ class NotebookRepository {
     final strokesByPage = <String, List<Stroke>>{};
     final shapesByPage = <String, List<ShapeObject>>{};
     final textsByPage = <String, List<TextBoxObject>>{};
+    final imagesByPage = <String, List<ImageObject>>{};
     final activeByPage = <String, String>{};
 
     for (final p in pageRows) {
@@ -712,6 +727,7 @@ class NotebookRepository {
       strokesByPage[p.id] = [];
       shapesByPage[p.id] = [];
       textsByPage[p.id] = [];
+      imagesByPage[p.id] = [];
       for (final o in objRows) {
         final json = jsonDecode(o.data) as Map<String, dynamic>;
         switch (o.kind) {
@@ -721,6 +737,8 @@ class NotebookRepository {
             shapesByPage[p.id]!.add(ShapeObject.fromJson(json));
           case 'text':
             textsByPage[p.id]!.add(TextBoxObject.fromJson(json));
+          case 'image':
+            imagesByPage[p.id]!.add(ImageObject.fromJson(json));
           // 'tape' rows from older schema versions are silently dropped —
           // tape is now expressed as ToolKind.tape on a stroke.
         }
@@ -734,6 +752,7 @@ class NotebookRepository {
       strokesByPage: strokesByPage,
       shapesByPage: shapesByPage,
       textsByPage: textsByPage,
+      imagesByPage: imagesByPage,
       activeLayerByPage: activeByPage,
     );
   }

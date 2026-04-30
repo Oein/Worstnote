@@ -12,6 +12,7 @@
 // drawing is reactive and the UI re-renders strictly from state.
 
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
@@ -21,6 +22,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/ids.dart';
 import '../../../domain/layer.dart';
+import '../../../features/import/asset_service.dart';
 import '../../../domain/page.dart';
 import '../../../domain/page_object.dart';
 import '../../../domain/stroke.dart';
@@ -57,6 +59,7 @@ class CanvasView extends ConsumerStatefulWidget {
     required this.onStrokeCommitted,
     this.shapesByLayer = const {},
     this.textsByLayer = const {},
+    this.imagesByLayer = const {},
     this.onShapeCommitted,
     this.onTextCommitted,
     this.onTextChanged,
@@ -74,6 +77,7 @@ class CanvasView extends ConsumerStatefulWidget {
   final Map<String, List<Stroke>> strokesByLayer;
   final Map<String, List<ShapeObject>> shapesByLayer;
   final Map<String, List<TextBoxObject>> textsByLayer;
+  final Map<String, List<ImageObject>> imagesByLayer;
   final String activeLayerId;
   final ToolKind tool;
   final int colorArgb;
@@ -774,73 +778,65 @@ class _CanvasViewState extends ConsumerState<CanvasView> {
     return null;
   }
 
-  /// Build the visual slices for [layer] interleaving non-tape strokes,
-  /// shapes and text boxes by `createdAt` so the **draw order** is the
-  /// z-order. Consecutive non-text objects share one CustomPaint slice;
-  /// each text becomes its own positioned widget.
+  /// Build visual slices for [layer] in fixed z-order:
+  ///   images → highlighter strokes → pen/shape strokes → text boxes
   List<Widget> _buildLayerSlices(Layer layer) {
-    final strokes = (widget.strokesByLayer[layer.id] ?? const <Stroke>[])
-        .where((s) => !s.deleted && s.tool != ToolKind.tape);
-    final shapes = (widget.shapesByLayer[layer.id] ?? const <ShapeObject>[])
-        .where((s) => !s.deleted);
-    final texts = (widget.textsByLayer[layer.id] ?? const <TextBoxObject>[])
-        .where((t) => !t.deleted);
+    final allStrokes = (widget.strokesByLayer[layer.id] ?? const <Stroke>[])
+        .where((s) => !s.deleted && s.tool != ToolKind.tape)
+        .toList();
+    final allShapes = (widget.shapesByLayer[layer.id] ?? const <ShapeObject>[])
+        .where((s) => !s.deleted)
+        .toList();
+    final allTexts = (widget.textsByLayer[layer.id] ?? const <TextBoxObject>[])
+        .where((t) => !t.deleted)
+        .toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    final allImages = (widget.imagesByLayer[layer.id] ?? const <ImageObject>[])
+        .where((img) => !img.deleted)
+        .toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
 
-    // 0 = stroke, 1 = shape, 2 = text
-    final entries = <(DateTime, int, dynamic)>[];
-    for (final s in strokes) entries.add((s.createdAt, 0, s));
-    for (final s in shapes) entries.add((s.createdAt, 1, s));
-    for (final t in texts) entries.add((t.createdAt, 2, t));
-    entries.sort((a, b) => a.$1.compareTo(b.$1));
-
-    final size =
-        Size(widget.page.spec.widthPt, widget.page.spec.heightPt);
+    final size = Size(widget.page.spec.widthPt, widget.page.spec.heightPt);
     final isTextTool = ref.watch(
         toolProvider.select((s) => s.activeTool == AppTool.text));
     final widgets = <Widget>[];
-    final pendingShapes = <ShapeObject>[];
-    final pendingStrokes = <Stroke>[];
 
-    void flushPaint() {
-      if (pendingShapes.isEmpty && pendingStrokes.isEmpty) return;
-      widgets.add(
-        RepaintBoundary(
-          child: CustomPaint(
-            painter: CombinedLayerPainter(
-              shapes: List<ShapeObject>.unmodifiable(pendingShapes),
-              strokes: List<Stroke>.unmodifiable(pendingStrokes),
-              layerOpacity: layer.opacity,
-            ),
-            size: size,
+    // Pass 1 — images (below highlighter and pen strokes).
+    for (final img in allImages) {
+      widgets.add(IgnorePointer(
+        child: _CanvasImage(image: img, layerOpacity: layer.opacity),
+      ));
+    }
+
+    // Pass 2 — strokes + shapes via CombinedLayerPainter
+    // (internally renders highlighters first, then shapes/pen strokes).
+    if (allStrokes.isNotEmpty || allShapes.isNotEmpty) {
+      widgets.add(RepaintBoundary(
+        child: CustomPaint(
+          painter: CombinedLayerPainter(
+            shapes: List<ShapeObject>.unmodifiable(allShapes),
+            strokes: List<Stroke>.unmodifiable(allStrokes),
+            layerOpacity: layer.opacity,
           ),
+          size: size,
         ),
-      );
-      pendingShapes.clear();
-      pendingStrokes.clear();
+      ));
     }
 
-    for (final e in entries) {
-      switch (e.$2) {
-        case 0:
-          pendingStrokes.add(e.$3 as Stroke);
-        case 1:
-          pendingShapes.add(e.$3 as ShapeObject);
-        case 2:
-          flushPaint();
-          final t = e.$3 as TextBoxObject;
-          widgets.add(IgnorePointer(
-            ignoring: !isTextTool,
-            child: TextLayer(
-              texts: [t],
-              layerId: layer.id,
-              editingBoxId:
-                  isTextTool && _editingTextBoxId == t.id ? t.id : null,
-              onChanged: widget.onTextChanged,
-            ),
-          ));
-      }
+    // Pass 3 — text boxes (topmost, sorted by createdAt).
+    for (final t in allTexts) {
+      widgets.add(IgnorePointer(
+        ignoring: !isTextTool,
+        child: TextLayer(
+          texts: [t],
+          layerId: layer.id,
+          editingBoxId:
+              isTextTool && _editingTextBoxId == t.id ? t.id : null,
+          onChanged: widget.onTextChanged,
+        ),
+      ));
     }
-    flushPaint();
+
     return widgets;
   }
 
@@ -2652,6 +2648,56 @@ class _CursorOverlayState extends ConsumerState<_CursorOverlay> {
           fillColor: fill,
         ),
         size: Size(widget.pageWidth, widget.pageHeight),
+      ),
+    );
+  }
+}
+
+/// Renders a single [ImageObject] on the canvas by loading its file from
+/// [AssetService] and displaying it at the object's bbox position/size.
+class _CanvasImage extends StatefulWidget {
+  const _CanvasImage({required this.image, required this.layerOpacity});
+  final ImageObject image;
+  final double layerOpacity;
+
+  @override
+  State<_CanvasImage> createState() => _CanvasImageState();
+}
+
+class _CanvasImageState extends State<_CanvasImage> {
+  File? _file;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(_CanvasImage old) {
+    super.didUpdateWidget(old);
+    if (old.image.assetId != widget.image.assetId) _load();
+  }
+
+  Future<void> _load() async {
+    final f = await AssetService().fileFor(widget.image.assetId);
+    if (mounted) setState(() => _file = f);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bbox = widget.image.bbox;
+    final f = _file;
+    return Positioned(
+      left: bbox.minX,
+      top: bbox.minY,
+      width: bbox.maxX - bbox.minX,
+      height: bbox.maxY - bbox.minY,
+      child: Opacity(
+        opacity: widget.layerOpacity.clamp(0.0, 1.0),
+        child: f != null
+            ? Image.file(f, fit: BoxFit.fill)
+            : const SizedBox.shrink(),
       ),
     );
   }

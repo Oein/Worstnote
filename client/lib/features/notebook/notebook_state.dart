@@ -32,6 +32,7 @@ class NotebookState {
     required this.strokesByPage,
     required this.shapesByPage,
     required this.textsByPage,
+    required this.imagesByPage,
     required this.activeLayerByPage,
   });
 
@@ -41,6 +42,7 @@ class NotebookState {
   final Map<String, List<Stroke>> strokesByPage;
   final Map<String, List<ShapeObject>> shapesByPage;
   final Map<String, List<TextBoxObject>> textsByPage;
+  final Map<String, List<ImageObject>> imagesByPage;
   final Map<String, String> activeLayerByPage;
 
   NotebookState copyWith({
@@ -50,6 +52,7 @@ class NotebookState {
     Map<String, List<Stroke>>? strokesByPage,
     Map<String, List<ShapeObject>>? shapesByPage,
     Map<String, List<TextBoxObject>>? textsByPage,
+    Map<String, List<ImageObject>>? imagesByPage,
     Map<String, String>? activeLayerByPage,
   }) =>
       NotebookState(
@@ -59,6 +62,7 @@ class NotebookState {
         strokesByPage: strokesByPage ?? this.strokesByPage,
         shapesByPage: shapesByPage ?? this.shapesByPage,
         textsByPage: textsByPage ?? this.textsByPage,
+        imagesByPage: imagesByPage ?? this.imagesByPage,
         activeLayerByPage: activeLayerByPage ?? this.activeLayerByPage,
       );
 }
@@ -104,6 +108,7 @@ NotebookState bootstrapNotebook({
     strokesByPage: {pageId: const []},
     shapesByPage: {pageId: const []},
     textsByPage: {pageId: const []},
+    imagesByPage: {pageId: const []},
     activeLayerByPage: {pageId: defaultLayerId},
   );
 }
@@ -362,6 +367,7 @@ class NotebookController extends Notifier<NotebookState> {
       strokesByPage: {...state.strokesByPage, pageId: const []},
       shapesByPage: {...state.shapesByPage, pageId: const []},
       textsByPage: {...state.textsByPage, pageId: const []},
+      imagesByPage: {...state.imagesByPage, pageId: const []},
       activeLayerByPage: {
         ...state.activeLayerByPage,
         pageId: defaultLayerId,
@@ -383,6 +389,8 @@ class NotebookController extends Notifier<NotebookState> {
       ..remove(pageId);
     final texts = Map<String, List<TextBoxObject>>.from(state.textsByPage)
       ..remove(pageId);
+    final images = Map<String, List<ImageObject>>.from(state.imagesByPage)
+      ..remove(pageId);
     final actives = Map<String, String>.from(state.activeLayerByPage)
       ..remove(pageId);
     _pushUndo();
@@ -392,6 +400,7 @@ class NotebookController extends Notifier<NotebookState> {
       strokesByPage: strokes,
       shapesByPage: shapes,
       textsByPage: texts,
+      imagesByPage: images,
       activeLayerByPage: actives,
     );
   }
@@ -451,11 +460,15 @@ class NotebookController extends Notifier<NotebookState> {
     final texts = (state.textsByPage[pageId] ?? const <TextBoxObject>[])
         .where((o) => o.layerId != layerId)
         .toList();
+    final images = (state.imagesByPage[pageId] ?? const <ImageObject>[])
+        .where((o) => o.layerId != layerId)
+        .toList();
     state = state.copyWith(
       layersByPage: {...state.layersByPage, pageId: next},
       strokesByPage: {...state.strokesByPage, pageId: strokes},
       shapesByPage: {...state.shapesByPage, pageId: shapes},
       textsByPage: {...state.textsByPage, pageId: texts},
+      imagesByPage: {...state.imagesByPage, pageId: images},
       activeLayerByPage: actives,
     );
   }
@@ -831,11 +844,26 @@ class NotebookController extends Notifier<NotebookState> {
     final texts = (state.textsByPage[pageId] ?? const <TextBoxObject>[])
         .map((s) => ids.contains(s.id) ? s.copyWith(deleted: true) : s)
         .toList();
+    final images = (state.imagesByPage[pageId] ?? const <ImageObject>[])
+        .map((s) => ids.contains(s.id) ? s.copyWith(deleted: true) : s)
+        .toList();
     _pushUndo();
     state = state.copyWith(
       strokesByPage: {...state.strokesByPage, pageId: strokes},
       shapesByPage: {...state.shapesByPage, pageId: shapes},
       textsByPage: {...state.textsByPage, pageId: texts},
+      imagesByPage: {...state.imagesByPage, pageId: images},
+    );
+  }
+
+  void addImage(ImageObject img) {
+    final list = [
+      ...?state.imagesByPage[img.pageId],
+      img.copyWith(layerId: _resolveTargetLayer(img.pageId)),
+    ];
+    _pushUndo();
+    state = state.copyWith(
+      imagesByPage: {...state.imagesByPage, img.pageId: list},
     );
   }
 
