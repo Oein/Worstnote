@@ -101,8 +101,7 @@ services:
       S3_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
       S3_USE_SSL: "false"
       JWT_SECRET: "${JWT_SECRET:?set in .env}"
-      ACCESS_TOKEN_TTL: "15m"
-      REFRESH_TOKEN_TTL: "720h"
+      ACCESS_TOKEN_TTL: "8760h"
       # hCaptcha (optional) — both must be set to enable captcha on signup.
       HCAPTCHA_SITEKEY: "${HCAPTCHA_SITEKEY:-}"
       HCAPTCHA_SECRET: "${HCAPTCHA_SECRET:-}"
