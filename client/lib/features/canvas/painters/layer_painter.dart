@@ -65,11 +65,21 @@ class CombinedLayerPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    // Build a unified ordered list. Each entry is (createdAt, isShape, obj).
+    // Pass 1: highlighter strokes — always behind shapes and other strokes.
+    final highlighters = strokes
+        .where((s) => !s.deleted && s.tool == ToolKind.highlighter)
+        .toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    for (final s in highlighters) {
+      _paintStroke(canvas, s);
+    }
+
+    // Pass 2: shapes + non-highlighter strokes interleaved by createdAt.
     final entries = <(DateTime, int, Object)>[];
     for (final s in strokes) {
       if (s.deleted) continue;
       if (s.tool == ToolKind.tape) continue;
+      if (s.tool == ToolKind.highlighter) continue;
       entries.add((s.createdAt, 0, s));
     }
     for (final shape in shapes) {

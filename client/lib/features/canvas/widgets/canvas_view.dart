@@ -2039,6 +2039,29 @@ class _CanvasViewState extends ConsumerState<CanvasView> {
               background: widget.page.spec.background,
               size: Size(widget.page.spec.widthPt, widget.page.spec.heightPt),
             ),
+          // Active highlighter stroke — rendered before committed layer content
+          // so it stays behind shapes/pen strokes, matching committed z-order.
+          if (at != AppTool.eraserStroke &&
+              at != AppTool.eraserArea &&
+              widget.tool == ToolKind.highlighter)
+            ValueListenableBuilder<List<StrokePoint>>(
+              valueListenable: _liveNotifier,
+              builder: (_, pts, __) => IgnorePointer(
+                child: CustomPaint(
+                  painter: ActiveStrokePainter(
+                    points: pts,
+                    tool: widget.tool,
+                    colorArgb: widget.colorArgb,
+                    widthPt: widget.widthPt,
+                    opacity: widget.opacity,
+                    lineStyle: _builder?.lineStyle ?? LineStyle.solid,
+                    dashGap: _builder?.dashGap ?? 1.0,
+                  ),
+                  size: Size(
+                      widget.page.spec.widthPt, widget.page.spec.heightPt),
+                ),
+              ),
+            ),
           for (final layer in sortedLayers)
             if (layer.visible)
               ..._buildLayerSlices(layer),
@@ -2065,10 +2088,11 @@ class _CanvasViewState extends ConsumerState<CanvasView> {
                   ),
                 ),
               ),
-          // Active stroke (in-progress drawing). Skip for eraser tools so
-          // the live preview doesn't paint an opaque white trail over the
-          // page background — the cursor circle already conveys position.
-          if (at != AppTool.eraserStroke && at != AppTool.eraserArea)
+          // Active stroke (in-progress drawing). Skip for eraser tools and
+          // highlighter (handled in the pre-layer slot above).
+          if (at != AppTool.eraserStroke &&
+              at != AppTool.eraserArea &&
+              widget.tool != ToolKind.highlighter)
             ValueListenableBuilder<List<StrokePoint>>(
               valueListenable: _liveNotifier,
               builder: (_, pts, __) => IgnorePointer(
