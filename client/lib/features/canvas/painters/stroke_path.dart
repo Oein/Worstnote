@@ -1,10 +1,5 @@
 // Shared utility for building a Path from StrokePoint lists.
-//
-// Uses quadratic Bézier curves through midpoints: each sample point is a
-// control point, each midpoint between consecutive samples is an on-curve
-// anchor.  This gives a C¹ smooth spline that is visually smooth even at
-// high zoom levels, unlike straight lineTo segments which show polygonal
-// kinks when zoomed in.
+// Uses quadratic Bézier curves through midpoints for C¹ smooth splines.
 
 import 'package:flutter/painting.dart';
 
@@ -15,16 +10,6 @@ Path buildStrokePath(List<StrokePoint> points) {
   final path = Path()..moveTo(points.first.x, points.first.y);
   if (points.length == 2) {
     path.lineTo(points.last.x, points.last.y);
-    return path;
-  }
-
-  // Recognized polygon / star vertices are very few points (≤12) with sharp
-  // corners — straight lineTo gives crisp edges. High-density freehand strokes
-  // and circles (≥24 pts) use Bézier for smooth curves.
-  if (points.length <= 12) {
-    for (int i = 1; i < points.length; i++) {
-      path.lineTo(points[i].x, points[i].y);
-    }
     return path;
   }
 
